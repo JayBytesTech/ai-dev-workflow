@@ -68,13 +68,22 @@ struct SessionStartArgs {
     topic: Option<String>,
     #[arg(long, value_name = "path")]
     cwd: Option<PathBuf>,
-    #[arg(long, help = "Run the tool and capture stdout/stderr to the transcript file")]
+    #[arg(
+        long,
+        help = "Run the tool and capture stdout/stderr to the transcript file"
+    )]
     wrap: bool,
     #[arg(long, value_name = "arg", num_args = 1.., help = "Arguments to pass to the tool when using --wrap")]
     tool_args: Vec<String>,
-    #[arg(long, help = "Use a PTY for richer transcript capture when wrapping a tool")]
+    #[arg(
+        long,
+        help = "Use a PTY for richer transcript capture when wrapping a tool"
+    )]
     pty: bool,
-    #[arg(long, help = "Disable the script(1) backend when using --pty (force native PTY)")]
+    #[arg(
+        long,
+        help = "Disable the script(1) backend when using --pty (force native PTY)"
+    )]
     no_script: bool,
     #[arg(long, help = "Force the script(1) backend when using --pty")]
     script: bool,
@@ -86,7 +95,10 @@ struct SessionStartArgs {
 
 #[derive(Args)]
 struct SessionEndArgs {
-    #[arg(long, help = "Generate dev-log fields from transcript and edit defaults")]
+    #[arg(
+        long,
+        help = "Generate dev-log fields from transcript and edit defaults"
+    )]
     auto: bool,
 }
 
@@ -96,6 +108,11 @@ struct SessionDoctorArgs {
     project: String,
     #[arg(long, value_name = "tool", default_value = "codex")]
     tool: String,
+    #[arg(
+        long,
+        help = "Repair stale active sessions with unfinished transcript capture state"
+    )]
+    repair: bool,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +279,10 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             println!("Transcript target: {}", state.transcript_path.display());
 
             if args.wrap {
+                let _ = aiw_session::update_capture_status(
+                    &store,
+                    aiw_session::TranscriptCaptureStatus::Capturing,
+                )?;
                 let tool_kind = aiw_ai_tools::ToolKind::parse(&args.tool)?;
                 let adapter = aiw_ai_tools::ToolAdapter::from_config(&config, tool_kind)?;
                 println!("Launching tool: {}", adapter.executable);
@@ -283,6 +304,13 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                         rows: args.pty_rows,
                     },
                 )?;
+                let _ = aiw_session::refresh_capture_checkpoint(&store)?;
+                let status = if code == 0 {
+                    aiw_session::TranscriptCaptureStatus::Flushed
+                } else {
+                    aiw_session::TranscriptCaptureStatus::Failed
+                };
+                let _ = aiw_session::update_capture_status(&store, status)?;
                 println!("Tool exited with code {code}");
             }
             Ok(())
@@ -352,6 +380,8 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                     }
                     println!("Started: {}", state.start_time_utc);
                     println!("Transcript: {}", state.transcript_path.display());
+                    println!("Capture status: {}", state.capture_status);
+                    println!("Transcript bytes: {}", state.last_transcript_size_bytes);
                 }
                 None => {
                     println!("No active session.");
@@ -419,8 +449,7 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
                 }
                 let prompt = build_note_prompt(&cmd.raw, &content);
                 let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
-                let block =
-                    format_note_result_block(cmd, &marker, &output.stdout, &output.stderr);
+                let block = format_note_result_block(cmd, &marker, &output.stdout, &output.stderr);
                 appended_blocks.push_str(&block);
                 processed += 1;
             }
@@ -437,7 +466,11 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
             updated.push_str(&appended_blocks);
             fs::write(&resolved, updated)
                 .with_context(|| format!("Failed to write note {}", resolved.display()))?;
-            println!("Processed {} command(s) in {}", processed, resolved.display());
+            println!(
+                "Processed {} command(s) in {}",
+                processed,
+                resolved.display()
+            );
             Ok(())
         }
     }
@@ -477,9 +510,7 @@ fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn session_state_dir(config_path: &Path) -> Result<PathBuf> {
-    let base = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(base.join(".aiw"))
 }
 
@@ -567,6 +598,7 @@ fn run_session_doctor(
 
     check_tool(config, &args.tool, &mut report);
     check_session_state_dir(state_dir, &mut report);
+    check_active_session_health(state_dir, args.repair, &mut report)?;
     check_binary_freshness(&mut report);
 
     println!();
@@ -581,18 +613,94 @@ fn run_session_doctor(
     Ok(())
 }
 
-fn check_project_paths(config: &aiw_config::Config, project: &aiw_config::ProjectConfig, report: &mut DoctorReport) {
-    let transcript_dir = match aiw_config::resolve_in_vault(&config.vault_path, &project.transcript_dir) {
-        Ok(path) => path,
-        Err(err) => {
-            report.add(DoctorLevel::Error, format!("invalid transcript_dir: {err}"));
-            return;
-        }
+fn check_active_session_health(
+    state_dir: &Path,
+    repair: bool,
+    report: &mut DoctorReport,
+) -> Result<()> {
+    let store = aiw_session::SessionStore::new(state_dir)?;
+    let Some(state) = store.load()? else {
+        report.add(DoctorLevel::Ok, "no active session state found");
+        return Ok(());
     };
+
+    report.add(
+        DoctorLevel::Warn,
+        format!(
+            "active session present: {} ({})",
+            state.id, state.capture_status
+        ),
+    );
+
+    if state.capture_status != aiw_session::TranscriptCaptureStatus::Capturing {
+        report.add(
+            DoctorLevel::Ok,
+            format!("capture state is terminal: {}", state.capture_status),
+        );
+        return Ok(());
+    }
+
+    if state.transcript_path.exists() {
+        let bytes = fs::metadata(&state.transcript_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        report.add(
+            DoctorLevel::Warn,
+            format!(
+                "capture is still marked capturing (transcript exists, {bytes} bytes): {}",
+                state.transcript_path.display()
+            ),
+        );
+    } else {
+        report.add(
+            DoctorLevel::Error,
+            format!(
+                "capture is marked capturing but transcript is missing: {}",
+                state.transcript_path.display()
+            ),
+        );
+    }
+
+    if repair {
+        let repaired = aiw_session::recover_active_session(&store)?;
+        if let Some(updated) = repaired {
+            report.add(
+                DoctorLevel::Ok,
+                format!(
+                    "repair applied: capture state is now {}",
+                    updated.capture_status
+                ),
+            );
+        }
+    } else {
+        report.add(
+            DoctorLevel::Warn,
+            "run session doctor with --repair to repair stale capture state",
+        );
+    }
+    Ok(())
+}
+
+fn check_project_paths(
+    config: &aiw_config::Config,
+    project: &aiw_config::ProjectConfig,
+    report: &mut DoctorReport,
+) {
+    let transcript_dir =
+        match aiw_config::resolve_in_vault(&config.vault_path, &project.transcript_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                report.add(DoctorLevel::Error, format!("invalid transcript_dir: {err}"));
+                return;
+            }
+        };
     if let Err(err) = fs::create_dir_all(&transcript_dir) {
         report.add(
             DoctorLevel::Error,
-            format!("cannot create transcript_dir {}: {err}", transcript_dir.display()),
+            format!(
+                "cannot create transcript_dir {}: {err}",
+                transcript_dir.display()
+            ),
         );
     } else {
         report.add(
@@ -601,7 +709,8 @@ fn check_project_paths(config: &aiw_config::Config, project: &aiw_config::Projec
         );
     }
 
-    let dev_log_dir = match aiw_config::resolve_in_vault(&config.vault_path, &project.dev_logs_dir) {
+    let dev_log_dir = match aiw_config::resolve_in_vault(&config.vault_path, &project.dev_logs_dir)
+    {
         Ok(path) => path,
         Err(err) => {
             report.add(DoctorLevel::Error, format!("invalid dev_logs_dir: {err}"));
@@ -611,7 +720,10 @@ fn check_project_paths(config: &aiw_config::Config, project: &aiw_config::Projec
     if let Err(err) = fs::create_dir_all(&dev_log_dir) {
         report.add(
             DoctorLevel::Error,
-            format!("cannot create dev_logs_dir {}: {err}", dev_log_dir.display()),
+            format!(
+                "cannot create dev_logs_dir {}: {err}",
+                dev_log_dir.display()
+            ),
         );
     } else {
         report.add(
@@ -622,20 +734,24 @@ fn check_project_paths(config: &aiw_config::Config, project: &aiw_config::Projec
 }
 
 fn check_template(config: &aiw_config::Config, report: &mut DoctorReport) {
-    let templates_root = match aiw_config::resolve_in_vault(&config.vault_path, &config.templates_dir) {
-        Ok(path) => path,
-        Err(err) => {
-            report.add(DoctorLevel::Error, format!("invalid templates_dir: {err}"));
-            return;
-        }
-    };
+    let templates_root =
+        match aiw_config::resolve_in_vault(&config.vault_path, &config.templates_dir) {
+            Ok(path) => path,
+            Err(err) => {
+                report.add(DoctorLevel::Error, format!("invalid templates_dir: {err}"));
+                return;
+            }
+        };
     let template_path = templates_root.join(&config.dev_log_template);
     let template = match fs::read_to_string(&template_path) {
         Ok(raw) => raw,
         Err(err) => {
             report.add(
                 DoctorLevel::Error,
-                format!("cannot read dev_log_template {}: {err}", template_path.display()),
+                format!(
+                    "cannot read dev_log_template {}: {err}",
+                    template_path.display()
+                ),
             );
             return;
         }
@@ -655,7 +771,10 @@ fn check_template(config: &aiw_config::Config, report: &mut DoctorReport) {
     ];
     for placeholder in required {
         if template.contains(placeholder) {
-            report.add(DoctorLevel::Ok, format!("template placeholder present: {placeholder}"));
+            report.add(
+                DoctorLevel::Ok,
+                format!("template placeholder present: {placeholder}"),
+            );
         } else {
             report.add(
                 DoctorLevel::Warn,
@@ -688,7 +807,10 @@ fn check_tool(config: &aiw_config::Config, tool: &str, report: &mut DoctorReport
     if executable_is_available(&adapter.executable) {
         report.add(
             DoctorLevel::Ok,
-            format!("tool executable found on PATH or filesystem: {}", adapter.executable),
+            format!(
+                "tool executable found on PATH or filesystem: {}",
+                adapter.executable
+            ),
         );
     } else {
         report.add(
@@ -739,7 +861,10 @@ fn check_binary_freshness(report: &mut DoctorReport) {
     let current = match std::env::current_exe() {
         Ok(path) => path,
         Err(err) => {
-            report.add(DoctorLevel::Warn, format!("cannot resolve current executable path: {err}"));
+            report.add(
+                DoctorLevel::Warn,
+                format!("cannot resolve current executable path: {err}"),
+            );
             return;
         }
     };
@@ -882,7 +1007,10 @@ fn read_transcript_tail(path: &Path, max_chars: usize) -> Result<String> {
     Ok(content.chars().skip(skip).collect())
 }
 
-fn build_session_end_auto_prompt(state: &aiw_session::SessionState, transcript_tail: &str) -> String {
+fn build_session_end_auto_prompt(
+    state: &aiw_session::SessionState,
+    transcript_tail: &str,
+) -> String {
     format!(
         "You generate a concise dev-log draft from a terminal transcript.\n\
 Return STRICT JSON only (no markdown, no code fences) with exactly these keys:\n\
@@ -969,7 +1097,10 @@ fn format_note_result_block(
     block.push_str("## AIW Results\n\n");
     block.push_str(marker);
     block.push('\n');
-    block.push_str(&format!("**AI Result ({})**\n\n", note_command_label(&cmd.command)));
+    block.push_str(&format!(
+        "**AI Result ({})**\n\n",
+        note_command_label(&cmd.command)
+    ));
     match cmd.command {
         aiw_obsidian::NoteCommand::ExtractTasks => {
             let body = format_tasks(stdout);
@@ -1026,7 +1157,11 @@ fn build_note_marker(cmd: &aiw_obsidian::NoteCommandMatch, note_content: &str) -
     input.push('|');
     input.push_str(&stable_hash(note_content).to_string());
     let hash = stable_hash(&input);
-    format!("<!-- AIW_RESULT: {} {} -->", note_command_label(&cmd.command), hash)
+    format!(
+        "<!-- AIW_RESULT: {} {} -->",
+        note_command_label(&cmd.command),
+        hash
+    )
 }
 
 fn stable_hash(input: &str) -> u64 {

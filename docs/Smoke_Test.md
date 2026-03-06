@@ -71,3 +71,15 @@ aiw session start --project ai-hub --tool claude --wrap --pty --tool-args --mode
 
 - Use the tool briefly, then exit.
 - Confirm a transcript file exists in `AI Sessions/raw/AI Hub/<date>/`.
+
+## 8) Capture health + repair
+
+```bash
+aiw session doctor --project ai-hub --tool claude
+```
+
+- If the tool or shell crashed during a wrapped session and doctor reports stale `capturing` state, run:
+
+```bash
+aiw session doctor --project ai-hub --tool claude --repair
+```

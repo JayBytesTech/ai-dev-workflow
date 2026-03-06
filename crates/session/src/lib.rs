@@ -19,6 +19,28 @@ use aiw_templates::{render_template, TemplateStore};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const STATE_FILE_NAME: &str = "session.json";
+const TRANSCRIPT_SYNC_INTERVAL_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptCaptureStatus {
+    Capturing,
+    Flushed,
+    Failed,
+    Recovered,
+}
+
+impl std::fmt::Display for TranscriptCaptureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Capturing => "capturing",
+            Self::Flushed => "flushed",
+            Self::Failed => "failed",
+            Self::Recovered => "recovered",
+        };
+        write!(f, "{value}")
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionState {
@@ -30,6 +52,12 @@ pub struct SessionState {
     pub start_time_utc: DateTime<Utc>,
     pub cwd: PathBuf,
     pub transcript_path: PathBuf,
+    #[serde(default = "default_capture_status")]
+    pub capture_status: TranscriptCaptureStatus,
+    #[serde(default = "default_capture_update_time")]
+    pub last_capture_update_utc: DateTime<Utc>,
+    #[serde(default)]
+    pub last_transcript_size_bytes: u64,
 }
 
 pub struct SessionStore {
@@ -121,17 +149,25 @@ pub fn start_session(
         start_time_utc: Utc::now(),
         cwd,
         transcript_path,
+        capture_status: TranscriptCaptureStatus::Capturing,
+        last_capture_update_utc: Utc::now(),
+        last_transcript_size_bytes: 0,
     };
 
+    let mut state = state;
     prepare_transcript(&state)?;
+    update_transcript_checkpoint(&mut state);
     store.save(&state)?;
     Ok(state)
 }
 
 pub fn end_session(store: &SessionStore) -> Result<SessionState> {
-    let state = store
+    let mut state = store
         .load()?
         .ok_or_else(|| anyhow!("no active session found"))?;
+    update_transcript_checkpoint(&mut state);
+    state.capture_status = TranscriptCaptureStatus::Flushed;
+    state.last_capture_update_utc = Utc::now();
     store.clear()?;
     Ok(state)
 }
@@ -148,13 +184,11 @@ pub fn collect_git_info(project: &ProjectConfig) -> GitInfo {
         };
     };
 
-    let status_summary = git_output(repo_root, &["status", "-sb"]).unwrap_or_else(|err| {
-        format!("Git status unavailable: {err}")
-    });
+    let status_summary = git_output(repo_root, &["status", "-sb"])
+        .unwrap_or_else(|err| format!("Git status unavailable: {err}"));
 
-    let files_changed = git_output(repo_root, &["status", "--porcelain"]).unwrap_or_else(|err| {
-        format!("Git status unavailable: {err}")
-    });
+    let files_changed = git_output(repo_root, &["status", "--porcelain"])
+        .unwrap_or_else(|err| format!("Git status unavailable: {err}"));
 
     let files_changed = if files_changed.trim().is_empty() {
         "No changes detected.".to_string()
@@ -195,7 +229,10 @@ pub fn write_dev_log(
     values.insert("decision", input.decision);
     values.insert("rationale", input.rationale);
     values.insert("follow_up_tasks", input.follow_up_tasks);
-    values.insert("transcript_path", session.transcript_path.display().to_string());
+    values.insert(
+        "transcript_path",
+        session.transcript_path.display().to_string(),
+    );
     values.insert(
         "transcript_link",
         format_obsidian_link(&config.vault_path, &session.transcript_path),
@@ -211,9 +248,8 @@ pub fn write_dev_log(
     let filename = format!("dev-log-{}.md", Local::now().format("%Y%m%d-%H%M%S"));
     let path = log_root.join(filename);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create dev log directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create dev log directory {}", parent.display()))?;
     }
     fs::write(&path, rendered)
         .with_context(|| format!("Failed to write dev log {}", path.display()))?;
@@ -270,19 +306,25 @@ pub fn run_tool_with_transcript(
     prefer_script: bool,
     pty: PtyConfig,
 ) -> Result<i32> {
-    if use_pty {
+    let result = if use_pty {
         #[cfg(unix)]
         if prefer_script {
             match run_tool_with_transcript_script(executable, args, transcript_path) {
                 Ok(code) => return Ok(code),
-                Err(err) => eprintln!(
-                    "[aiw] script backend unavailable, falling back to native PTY: {err}"
-                ),
+                Err(err) => {
+                    eprintln!("[aiw] script backend unavailable, falling back to native PTY: {err}")
+                }
             }
         }
-        return run_tool_with_transcript_pty(executable, args, transcript_path, pty);
+        run_tool_with_transcript_pty(executable, args, transcript_path, pty)
+    } else {
+        run_tool_with_transcript_pipe(executable, args, transcript_path)
+    };
+
+    if result.is_err() {
+        let _ = append_transcript_footer(transcript_path, -1);
     }
-    run_tool_with_transcript_pipe(executable, args, transcript_path)
+    result
 }
 
 fn normalize_tool(tool: &str) -> Result<&'static str> {
@@ -348,10 +390,10 @@ fn run_tool_with_transcript_pipe(
         .append(true)
         .open(transcript_path)
         .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
-    let file = Arc::new(Mutex::new(file));
+    let sink = Arc::new(Mutex::new(TranscriptSink::new(file)));
 
-    let out_handle = spawn_tee(stdout, file.clone(), true);
-    let err_handle = spawn_tee(stderr, file.clone(), false);
+    let out_handle = spawn_tee(stdout, sink.clone(), true);
+    let err_handle = spawn_tee(stderr, sink.clone(), false);
 
     let status = child
         .wait()
@@ -361,8 +403,10 @@ fn run_tool_with_transcript_pipe(
     err_handle.join().ok();
 
     let code = status.code().unwrap_or(-1);
-    let mut file = file.lock().expect("transcript file lock poisoned");
-    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+    if let Ok(mut sink) = sink.lock() {
+        sink.write_line(&format!("\n\n[aiw] tool exited with code {code}\n"));
+        sink.sync();
+    }
 
     Ok(code)
 }
@@ -409,9 +453,9 @@ fn run_tool_with_transcript_pty(
         .append(true)
         .open(transcript_path)
         .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
-    let file = Arc::new(Mutex::new(file));
+    let sink = Arc::new(Mutex::new(TranscriptSink::new(file)));
 
-    let out_handle = spawn_pty_reader(reader, file.clone());
+    let out_handle = spawn_pty_reader(reader, sink.clone());
     let _in_handle = thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0u8; 1024];
@@ -437,8 +481,10 @@ fn run_tool_with_transcript_pty(
     // reads even after the child exits, which would hang wrapper shutdown.
 
     let code = status.exit_code() as i32;
-    let mut file = file.lock().expect("transcript file lock poisoned");
-    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+    if let Ok(mut sink) = sink.lock() {
+        sink.write_line(&format!("\n\n[aiw] tool exited with code {code}\n"));
+        sink.sync();
+    }
 
     Ok(code)
 }
@@ -468,12 +514,7 @@ fn run_tool_with_transcript_script(
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(-1);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(transcript_path)
-        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
-    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+    append_transcript_footer(transcript_path, code).ok();
     Ok(code)
 }
 
@@ -548,10 +589,7 @@ impl Drop for TerminalRawModeGuard {
 fn prepare_transcript(state: &SessionState) -> Result<()> {
     if let Some(parent) = state.transcript_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create transcript directory {}",
-                parent.display()
-            )
+            format!("Failed to create transcript directory {}", parent.display())
         })?;
     }
     let mut file = fs::OpenOptions::new()
@@ -573,12 +611,18 @@ fn prepare_transcript(state: &SessionState) -> Result<()> {
         state.topic.clone().unwrap_or_else(|| "N/A".to_string()),
         state.cwd.display()
     )?;
+    file.sync_data().with_context(|| {
+        format!(
+            "Failed to sync transcript {}",
+            state.transcript_path.display()
+        )
+    })?;
     Ok(())
 }
 
 fn spawn_tee<R: Read + Send + 'static>(
     mut reader: R,
-    file: Arc<Mutex<fs::File>>,
+    sink: Arc<Mutex<TranscriptSink>>,
     to_stdout: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -597,8 +641,8 @@ fn spawn_tee<R: Read + Send + 'static>(
                         let _ = out.write_all(chunk);
                         out.flush()
                     };
-                    if let Ok(mut file) = file.lock() {
-                        let _ = file.write_all(chunk);
+                    if let Ok(mut sink) = sink.lock() {
+                        sink.write_chunk(chunk);
                     }
                 }
                 Err(_) => break,
@@ -609,7 +653,7 @@ fn spawn_tee<R: Read + Send + 'static>(
 
 fn spawn_pty_reader<R: Read + Send + 'static>(
     mut reader: R,
-    file: Arc<Mutex<fs::File>>,
+    sink: Arc<Mutex<TranscriptSink>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; 4096];
@@ -621,8 +665,8 @@ fn spawn_pty_reader<R: Read + Send + 'static>(
                     let mut out = std::io::stdout();
                     let _ = out.write_all(chunk);
                     let _ = out.flush();
-                    if let Ok(mut file) = file.lock() {
-                        let _ = file.write_all(chunk);
+                    if let Ok(mut sink) = sink.lock() {
+                        sink.write_chunk(chunk);
                     }
                 }
                 Err(_) => break,
@@ -638,6 +682,114 @@ pub fn cleanup_transcript(path: &Path) -> Result<()> {
     fs::write(path, cleaned)
         .with_context(|| format!("Failed to write transcript {}", path.display()))?;
     Ok(())
+}
+
+pub fn refresh_capture_checkpoint(store: &SessionStore) -> Result<Option<SessionState>> {
+    let mut state = match store.load()? {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+    update_transcript_checkpoint(&mut state);
+    state.last_capture_update_utc = Utc::now();
+    store.save(&state)?;
+    Ok(Some(state))
+}
+
+pub fn update_capture_status(
+    store: &SessionStore,
+    status: TranscriptCaptureStatus,
+) -> Result<Option<SessionState>> {
+    let mut state = match store.load()? {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+    state.capture_status = status;
+    update_transcript_checkpoint(&mut state);
+    state.last_capture_update_utc = Utc::now();
+    store.save(&state)?;
+    Ok(Some(state))
+}
+
+pub fn recover_active_session(store: &SessionStore) -> Result<Option<SessionState>> {
+    let mut state = match store.load()? {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+
+    if state.capture_status != TranscriptCaptureStatus::Capturing {
+        return Ok(Some(state));
+    }
+
+    update_transcript_checkpoint(&mut state);
+    if state.transcript_path.exists() {
+        append_transcript_footer(&state.transcript_path, -1).ok();
+        state.capture_status = TranscriptCaptureStatus::Recovered;
+    } else {
+        state.capture_status = TranscriptCaptureStatus::Failed;
+    }
+    state.last_capture_update_utc = Utc::now();
+    update_transcript_checkpoint(&mut state);
+    store.save(&state)?;
+    Ok(Some(state))
+}
+
+fn default_capture_status() -> TranscriptCaptureStatus {
+    TranscriptCaptureStatus::Capturing
+}
+
+fn default_capture_update_time() -> DateTime<Utc> {
+    Utc::now()
+}
+
+fn update_transcript_checkpoint(state: &mut SessionState) {
+    state.last_transcript_size_bytes = fs::metadata(&state.transcript_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+}
+
+fn append_transcript_footer(transcript_path: &Path, code: i32) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
+    let mut sink = TranscriptSink::new(file);
+    sink.write_line(&format!("\n\n[aiw] tool exited with code {code}\n"));
+    sink.sync();
+    Ok(())
+}
+
+struct TranscriptSink {
+    file: fs::File,
+    pending_sync_bytes: usize,
+}
+
+impl TranscriptSink {
+    fn new(file: fs::File) -> Self {
+        Self {
+            file,
+            pending_sync_bytes: 0,
+        }
+    }
+
+    fn write_chunk(&mut self, chunk: &[u8]) {
+        if self.file.write_all(chunk).is_ok() {
+            self.pending_sync_bytes = self.pending_sync_bytes.saturating_add(chunk.len());
+            if self.pending_sync_bytes >= TRANSCRIPT_SYNC_INTERVAL_BYTES {
+                self.sync();
+            }
+        }
+    }
+
+    fn write_line(&mut self, line: &str) {
+        self.write_chunk(line.as_bytes());
+    }
+
+    fn sync(&mut self) {
+        if self.file.sync_data().is_ok() {
+            self.pending_sync_bytes = 0;
+        }
+    }
 }
 
 fn strip_terminal_control_sequences(input: &[u8]) -> String {
@@ -746,6 +898,9 @@ mod tests {
             start_time_utc: Utc::now(),
             cwd: PathBuf::from("/tmp"),
             transcript_path,
+            capture_status: TranscriptCaptureStatus::Capturing,
+            last_capture_update_utc: Utc::now(),
+            last_transcript_size_bytes: 0,
         }
     }
 
@@ -840,5 +995,41 @@ mod tests {
         cleanup_transcript(&path).expect("cleanup");
         let cleaned = fs::read_to_string(path).expect("read");
         assert_eq!(cleaned, "hello\nred text\ndone\n");
+    }
+
+    #[test]
+    fn refresh_capture_checkpoint_updates_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.log");
+        fs::write(&transcript, "hello world\n").expect("write transcript");
+        let store = SessionStore::new(dir.path()).expect("store");
+        let state = build_session(transcript.clone());
+        store.save(&state).expect("save");
+
+        let updated = refresh_capture_checkpoint(&store)
+            .expect("refresh")
+            .expect("active session");
+
+        assert_eq!(updated.last_transcript_size_bytes, 12);
+        assert!(updated.last_capture_update_utc >= state.last_capture_update_utc);
+    }
+
+    #[test]
+    fn recover_active_session_marks_recovered_and_appends_footer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.log");
+        fs::write(&transcript, "partial output\n").expect("write transcript");
+        let store = SessionStore::new(dir.path()).expect("store");
+        let state = build_session(transcript.clone());
+        store.save(&state).expect("save");
+
+        let updated = recover_active_session(&store)
+            .expect("recover")
+            .expect("active session");
+
+        assert_eq!(updated.capture_status, TranscriptCaptureStatus::Recovered);
+        assert!(updated.last_transcript_size_bytes > 0);
+        let content = fs::read_to_string(transcript).expect("read transcript");
+        assert!(content.contains("[aiw] tool exited with code -1"));
     }
 }
