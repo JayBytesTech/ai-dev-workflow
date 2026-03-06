@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -183,12 +183,19 @@ impl Config {
                 .push(format!("project {key} allowed_note_folders cannot be empty"));
         }
 
+        let mut seen = HashSet::new();
         for folder in &project.allowed_note_folders {
             self.validate_vault_relative(
                 &format!("projects.{key}.allowed_note_folders"),
                 folder,
                 report,
             );
+            let normalized = folder.to_string_lossy().to_string();
+            if !seen.insert(normalized.clone()) {
+                report.warnings.push(format!(
+                    "project {key} allowed_note_folders has duplicate entry: {normalized}"
+                ));
+            }
         }
     }
 
@@ -313,4 +320,3 @@ fn executable_exists(executable: &str) -> Result<()> {
 
     Err(anyhow!("executable not found in PATH"))
 }
-
