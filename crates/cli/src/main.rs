@@ -3,6 +3,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -54,6 +55,7 @@ enum SessionCommands {
     Start(SessionStartArgs),
     End(SessionEndArgs),
     Status,
+    Doctor(SessionDoctorArgs),
 }
 
 #[derive(Args)]
@@ -86,6 +88,14 @@ struct SessionStartArgs {
 struct SessionEndArgs {
     #[arg(long, help = "Generate dev-log fields from transcript and edit defaults")]
     auto: bool,
+}
+
+#[derive(Args)]
+struct SessionDoctorArgs {
+    #[arg(long, value_name = "name")]
+    project: String,
+    #[arg(long, value_name = "tool", default_value = "codex")]
+    tool: String,
 }
 
 #[derive(Subcommand)]
@@ -224,7 +234,7 @@ fn handle_projects(cmd: ProjectsCommands, config_path: Option<&Path>) -> Result<
 fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()> {
     let config_path = resolve_config_path(config_path)?;
     let state_dir = session_state_dir(&config_path)?;
-    let store = aiw_session::SessionStore::new(state_dir)?;
+    let store = aiw_session::SessionStore::new(&state_dir)?;
 
     match cmd {
         SessionCommands::Start(args) => {
@@ -349,6 +359,10 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             }
             Ok(())
         }
+        SessionCommands::Doctor(args) => {
+            let config = aiw_config::Config::load(&config_path)?;
+            run_session_doctor(&config, &config_path, &state_dir, &args)
+        }
     }
 }
 
@@ -467,6 +481,294 @@ fn session_state_dir(config_path: &Path) -> Result<PathBuf> {
         .parent()
         .unwrap_or_else(|| Path::new("."));
     Ok(base.join(".aiw"))
+}
+
+#[derive(Clone, Copy)]
+enum DoctorLevel {
+    Ok,
+    Warn,
+    Error,
+}
+
+struct DoctorReport {
+    ok: usize,
+    warn: usize,
+    error: usize,
+}
+
+impl DoctorReport {
+    fn new() -> Self {
+        Self {
+            ok: 0,
+            warn: 0,
+            error: 0,
+        }
+    }
+
+    fn add(&mut self, level: DoctorLevel, message: impl AsRef<str>) {
+        match level {
+            DoctorLevel::Ok => {
+                self.ok += 1;
+                println!("[ok] {}", message.as_ref());
+            }
+            DoctorLevel::Warn => {
+                self.warn += 1;
+                println!("[warn] {}", message.as_ref());
+            }
+            DoctorLevel::Error => {
+                self.error += 1;
+                println!("[error] {}", message.as_ref());
+            }
+        }
+    }
+}
+
+fn run_session_doctor(
+    config: &aiw_config::Config,
+    config_path: &Path,
+    state_dir: &Path,
+    args: &SessionDoctorArgs,
+) -> Result<()> {
+    println!("Session doctor report");
+    println!("Config: {}", config_path.display());
+    println!("Project: {}", args.project);
+    println!("Tool: {}", args.tool);
+    println!();
+
+    let mut report = DoctorReport::new();
+    let validation = config.validate();
+    if validation.is_ok() {
+        report.add(DoctorLevel::Ok, "config validation passed");
+    } else {
+        for err in validation.errors {
+            report.add(DoctorLevel::Error, format!("config error: {err}"));
+        }
+    }
+    for warning in validation.warnings {
+        report.add(DoctorLevel::Warn, format!("config warning: {warning}"));
+    }
+
+    match config.projects.get(&args.project) {
+        Some(project) => {
+            report.add(
+                DoctorLevel::Ok,
+                format!("project exists: {}", project.display_name),
+            );
+            check_project_paths(config, project, &mut report);
+            check_template(config, &mut report);
+        }
+        None => {
+            report.add(
+                DoctorLevel::Error,
+                format!("project not found in config: {}", args.project),
+            );
+        }
+    }
+
+    check_tool(config, &args.tool, &mut report);
+    check_session_state_dir(state_dir, &mut report);
+    check_binary_freshness(&mut report);
+
+    println!();
+    println!(
+        "Doctor summary: {} ok, {} warning(s), {} error(s)",
+        report.ok, report.warn, report.error
+    );
+
+    if report.error > 0 {
+        return Err(anyhow::anyhow!("session doctor found errors"));
+    }
+    Ok(())
+}
+
+fn check_project_paths(config: &aiw_config::Config, project: &aiw_config::ProjectConfig, report: &mut DoctorReport) {
+    let transcript_dir = match aiw_config::resolve_in_vault(&config.vault_path, &project.transcript_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            report.add(DoctorLevel::Error, format!("invalid transcript_dir: {err}"));
+            return;
+        }
+    };
+    if let Err(err) = fs::create_dir_all(&transcript_dir) {
+        report.add(
+            DoctorLevel::Error,
+            format!("cannot create transcript_dir {}: {err}", transcript_dir.display()),
+        );
+    } else {
+        report.add(
+            DoctorLevel::Ok,
+            format!("transcript_dir accessible: {}", transcript_dir.display()),
+        );
+    }
+
+    let dev_log_dir = match aiw_config::resolve_in_vault(&config.vault_path, &project.dev_logs_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            report.add(DoctorLevel::Error, format!("invalid dev_logs_dir: {err}"));
+            return;
+        }
+    };
+    if let Err(err) = fs::create_dir_all(&dev_log_dir) {
+        report.add(
+            DoctorLevel::Error,
+            format!("cannot create dev_logs_dir {}: {err}", dev_log_dir.display()),
+        );
+    } else {
+        report.add(
+            DoctorLevel::Ok,
+            format!("dev_logs_dir accessible: {}", dev_log_dir.display()),
+        );
+    }
+}
+
+fn check_template(config: &aiw_config::Config, report: &mut DoctorReport) {
+    let templates_root = match aiw_config::resolve_in_vault(&config.vault_path, &config.templates_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            report.add(DoctorLevel::Error, format!("invalid templates_dir: {err}"));
+            return;
+        }
+    };
+    let template_path = templates_root.join(&config.dev_log_template);
+    let template = match fs::read_to_string(&template_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            report.add(
+                DoctorLevel::Error,
+                format!("cannot read dev_log_template {}: {err}", template_path.display()),
+            );
+            return;
+        }
+    };
+    report.add(
+        DoctorLevel::Ok,
+        format!("dev_log_template loaded: {}", template_path.display()),
+    );
+
+    let required = [
+        "{{summary}}",
+        "{{decision}}",
+        "{{rationale}}",
+        "{{follow_up_tasks}}",
+        "{{transcript_link}}",
+        "{{transcript_excerpt}}",
+    ];
+    for placeholder in required {
+        if template.contains(placeholder) {
+            report.add(DoctorLevel::Ok, format!("template placeholder present: {placeholder}"));
+        } else {
+            report.add(
+                DoctorLevel::Warn,
+                format!("template placeholder missing: {placeholder}"),
+            );
+        }
+    }
+}
+
+fn check_tool(config: &aiw_config::Config, tool: &str, report: &mut DoctorReport) {
+    let kind = match aiw_ai_tools::ToolKind::parse(tool) {
+        Ok(kind) => kind,
+        Err(err) => {
+            report.add(DoctorLevel::Error, format!("unsupported tool: {err}"));
+            return;
+        }
+    };
+    let adapter = match aiw_ai_tools::ToolAdapter::from_config(config, kind) {
+        Ok(adapter) => adapter,
+        Err(err) => {
+            report.add(DoctorLevel::Error, format!("tool config error: {err}"));
+            return;
+        }
+    };
+    report.add(
+        DoctorLevel::Ok,
+        format!("tool executable configured: {}", adapter.executable),
+    );
+
+    if executable_is_available(&adapter.executable) {
+        report.add(
+            DoctorLevel::Ok,
+            format!("tool executable found on PATH or filesystem: {}", adapter.executable),
+        );
+    } else {
+        report.add(
+            DoctorLevel::Error,
+            format!("tool executable not found: {}", adapter.executable),
+        );
+    }
+}
+
+fn executable_is_available(executable: &str) -> bool {
+    let path = Path::new(executable);
+    if path.components().count() > 1 {
+        return path.exists();
+    }
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(executable).exists())
+}
+
+fn check_session_state_dir(state_dir: &Path, report: &mut DoctorReport) {
+    if let Err(err) = fs::create_dir_all(state_dir) {
+        report.add(
+            DoctorLevel::Error,
+            format!("cannot create state dir {}: {err}", state_dir.display()),
+        );
+        return;
+    }
+    let probe = state_dir.join("doctor-write-test.tmp");
+    match fs::write(&probe, b"ok") {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            report.add(
+                DoctorLevel::Ok,
+                format!("state dir writable: {}", state_dir.display()),
+            );
+        }
+        Err(err) => {
+            report.add(
+                DoctorLevel::Error,
+                format!("state dir not writable {}: {err}", state_dir.display()),
+            );
+        }
+    }
+}
+
+fn check_binary_freshness(report: &mut DoctorReport) {
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            report.add(DoctorLevel::Warn, format!("cannot resolve current executable path: {err}"));
+            return;
+        }
+    };
+    report.add(
+        DoctorLevel::Ok,
+        format!("current aiw binary: {}", current.display()),
+    );
+
+    let debug = PathBuf::from("target/debug/aiw");
+    if !debug.exists() {
+        return;
+    }
+
+    let current_mtime = fs::metadata(&current)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let debug_mtime = fs::metadata(&debug)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    if current != debug && debug_mtime > current_mtime {
+        report.add(
+            DoctorLevel::Warn,
+            format!(
+                "newer workspace binary detected at {}. If behavior differs, run this newer binary or reinstall.",
+                debug.display()
+            ),
+        );
+    }
 }
 
 fn prompt_dev_log_input() -> Result<aiw_session::DevLogInput> {
