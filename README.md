@@ -17,6 +17,20 @@ The binary is `aiw` and can be run from the workspace:
 cargo run -p aiw -- --help
 ```
 
+## Install
+
+From a tagged release with Cargo:
+
+```bash
+cargo install --git https://github.com/JayBytesTech/ai-dev-workflow --tag v0.1.0 aiw
+```
+
+From GitHub Releases binaries:
+
+1. Download the archive matching your OS/architecture from the Releases page.
+2. Extract `aiw` (or `aiw.exe` on Windows).
+3. Add the extracted binary to your `PATH`.
+
 ## Config
 
 Create a starter config:
@@ -103,3 +117,34 @@ Default templates live in `templates/` and are copied from the bootstrap package
 - Raw transcripts and curated notes are stored separately.
 - Explicit tool selection is required (claude, gemini, codex).
 - Obsidian is treated as a filesystem vault in v1.
+
+## Post-install Smoke Test
+
+This sequence validates install + basic config wiring using local temp paths:
+
+```bash
+tmp_root="$(mktemp -d)"
+mkdir -p "$tmp_root/vault/Templates" "$tmp_root/bin"
+printf '#!/usr/bin/env sh\necho mock-tool\n' > "$tmp_root/bin/mocktool"
+chmod +x "$tmp_root/bin/mocktool"
+
+aiw config init --output "$tmp_root/ai-dev-workflow.toml"
+sed -i "s|/path/to/ObsidianVault|$tmp_root/vault|g" "$tmp_root/ai-dev-workflow.toml"
+sed -i "s|/path/to/projects/ai-hub|$tmp_root/repo|g" "$tmp_root/ai-dev-workflow.toml"
+sed -i "s|claude-code|$tmp_root/bin/mocktool|g; s|gemini|$tmp_root/bin/mocktool|g; s|codex|$tmp_root/bin/mocktool|g" "$tmp_root/ai-dev-workflow.toml"
+
+cp templates/AIW_Dev_Log.md "$tmp_root/vault/Templates/"
+cp templates/AIW_ADR.md "$tmp_root/vault/Templates/"
+mkdir -p "$tmp_root/repo"
+
+aiw --config "$tmp_root/ai-dev-workflow.toml" config validate
+aiw --config "$tmp_root/ai-dev-workflow.toml" session doctor --project ai-hub --tool codex
+```
+
+## Release Process
+
+1. Update `crates/cli/Cargo.toml` version.
+2. Update [`CHANGELOG.md`](CHANGELOG.md) under `## [Unreleased]`.
+3. Commit and tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. GitHub Actions builds release archives and publishes a GitHub Release.
+5. Edit release notes using [`.github/release-template.md`](.github/release-template.md).
