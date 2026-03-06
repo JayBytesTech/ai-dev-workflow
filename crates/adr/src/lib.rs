@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Local;
 
 use aiw_config::{resolve_in_vault, Config, ProjectConfig};
@@ -42,16 +42,16 @@ pub fn create_adr(config: &Config, project: &ProjectConfig, input: AdrInput) -> 
     let rendered = render_template(&template, &values);
 
     let filename = format!(
-        \"ADR-{:04}-{}.md\",
+        "ADR-{:04}-{}.md",
         adr_number,
         slugify(&input.title)
     );
     let path = adr_root.join(filename);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!(\"Failed to create ADR directory {}\", parent.display()))?;
+            .with_context(|| format!("Failed to create ADR directory {}", parent.display()))?;
     }
-    fs::write(&path, rendered).with_context(|| format!(\"Failed to write {}\", path.display()))?;
+    fs::write(&path, rendered).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(path)
 }
 
@@ -60,7 +60,7 @@ fn next_adr_number(root: &Path) -> Result<u32> {
         return Ok(1);
     }
     let mut max_seen = 0u32;
-    for entry in fs::read_dir(root).with_context(|| \"Failed to read ADR directory\")? {
+    for entry in fs::read_dir(root).with_context(|| "Failed to read ADR directory")? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();

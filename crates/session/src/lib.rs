@@ -376,7 +376,7 @@ fn run_tool_with_transcript_pty(
     out_handle.join().ok();
     in_handle.join().ok();
 
-    let code = status.code().unwrap_or(-1);
+    let code = status.exit_code() as i32;
     let mut file = file.lock().expect("transcript file lock poisoned");
     writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
 

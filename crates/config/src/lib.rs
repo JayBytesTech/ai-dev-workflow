@@ -27,7 +27,7 @@ pub struct ToolsConfig {
     pub codex: ToolConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ToolConfig {
     pub executable: String,
@@ -295,8 +295,8 @@ fn executable_exists(executable: &str) -> Result<()> {
     if cfg!(windows) {
         let pathext = std::env::var_os("PATHEXT")
             .unwrap_or_else(|| OsStr::new(".EXE;.CMD;.BAT").to_os_string());
+        let pathext = pathext.to_string_lossy().to_string();
         let extensions: Vec<_> = pathext
-            .to_string_lossy()
             .split(';')
             .filter(|ext| !ext.is_empty())
             .collect();

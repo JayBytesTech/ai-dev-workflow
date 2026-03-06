@@ -18,10 +18,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(subcommand)]
     Config(ConfigCommands),
+    #[command(subcommand)]
     Session(SessionCommands),
+    #[command(subcommand)]
     Note(NoteCommands),
+    #[command(subcommand)]
     Adr(AdrCommands),
+    #[command(subcommand)]
     Projects(ProjectsCommands),
 }
 
@@ -263,11 +268,6 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             Ok(())
         }
     }
-}
-
-fn handle_placeholder<T>(area: &str, _cmd: T) -> Result<()> {
-    println!("{area} commands are not implemented yet.");
-    Ok(())
 }
 
 fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
