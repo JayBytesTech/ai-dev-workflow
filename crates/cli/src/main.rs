@@ -16,6 +16,8 @@ const DEFAULT_CONFIG_FILE: &str = "ai-dev-workflow.toml";
 struct Cli {
     #[arg(long, value_name = "path")]
     config: Option<PathBuf>,
+    #[arg(long, value_name = "name")]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -39,6 +41,7 @@ enum Commands {
 enum ConfigCommands {
     Init(ConfigInitArgs),
     Validate(ConfigValidateArgs),
+    Show(ConfigShowArgs),
 }
 
 #[derive(Args)]
@@ -49,6 +52,15 @@ struct ConfigInitArgs {
 
 #[derive(Args)]
 struct ConfigValidateArgs {}
+
+#[derive(Args)]
+struct ConfigShowArgs {
+    #[arg(
+        long,
+        help = "Show the fully resolved config after profile/env overrides"
+    )]
+    resolved: bool,
+}
 
 #[derive(Subcommand)]
 enum SessionCommands {
@@ -242,16 +254,21 @@ fn detect_terminal_size() -> Option<(u16, u16)> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let profile = cli.profile.as_deref();
     match cli.command {
-        Commands::Config(cmd) => handle_config(cmd, cli.config.as_deref()),
-        Commands::Projects(cmd) => handle_projects(cmd, cli.config.as_deref()),
-        Commands::Session(cmd) => handle_session(cmd, cli.config.as_deref()),
-        Commands::Note(cmd) => handle_note(cmd, cli.config.as_deref()),
-        Commands::Adr(cmd) => handle_adr(cmd, cli.config.as_deref()),
+        Commands::Config(cmd) => handle_config(cmd, cli.config.as_deref(), profile),
+        Commands::Projects(cmd) => handle_projects(cmd, cli.config.as_deref(), profile),
+        Commands::Session(cmd) => handle_session(cmd, cli.config.as_deref(), profile),
+        Commands::Note(cmd) => handle_note(cmd, cli.config.as_deref(), profile),
+        Commands::Adr(cmd) => handle_adr(cmd, cli.config.as_deref(), profile),
     }
 }
 
-fn handle_config(cmd: ConfigCommands, config_path: Option<&Path>) -> Result<()> {
+fn handle_config(
+    cmd: ConfigCommands,
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<()> {
     match cmd {
         ConfigCommands::Init(args) => {
             let target = args
@@ -264,7 +281,7 @@ fn handle_config(cmd: ConfigCommands, config_path: Option<&Path>) -> Result<()> 
         }
         ConfigCommands::Validate(_) => {
             let config_path = resolve_config_path(config_path)?;
-            let config = aiw_config::Config::load(&config_path)?;
+            let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
             let report = config.validate();
             println!("{report}");
             if report.is_ok() {
@@ -273,14 +290,32 @@ fn handle_config(cmd: ConfigCommands, config_path: Option<&Path>) -> Result<()> 
                 Err(anyhow::anyhow!("config validation failed"))
             }
         }
+        ConfigCommands::Show(args) => {
+            let config_path = resolve_config_path(config_path)?;
+            if args.resolved {
+                let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
+                let rendered = toml::to_string_pretty(&config)
+                    .context("Failed to serialize resolved config")?;
+                print!("{rendered}");
+            } else {
+                let raw = fs::read_to_string(&config_path)
+                    .with_context(|| format!("Failed to read {}", config_path.display()))?;
+                print!("{raw}");
+            }
+            Ok(())
+        }
     }
 }
 
-fn handle_projects(cmd: ProjectsCommands, config_path: Option<&Path>) -> Result<()> {
+fn handle_projects(
+    cmd: ProjectsCommands,
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<()> {
     match cmd {
         ProjectsCommands::List => {
             let config_path = resolve_config_path(config_path)?;
-            let config = aiw_config::Config::load(&config_path)?;
+            let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
             if config.projects.is_empty() {
                 println!("No projects configured.");
                 return Ok(());
@@ -294,14 +329,18 @@ fn handle_projects(cmd: ProjectsCommands, config_path: Option<&Path>) -> Result<
     }
 }
 
-fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()> {
+fn handle_session(
+    cmd: SessionCommands,
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<()> {
     let config_path = resolve_config_path(config_path)?;
-    let state_dir = session_state_dir(&config_path)?;
+    let state_dir = session_state_dir(&config_path, profile);
     let store = aiw_session::SessionStore::new(&state_dir)?;
 
     match cmd {
         SessionCommands::Start(args) => {
-            let config = aiw_config::Config::load(&config_path)?;
+            let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
             let report = config.validate();
             if !report.is_ok() {
                 println!("{report}");
@@ -362,7 +401,7 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             Ok(())
         }
         SessionCommands::End(args) => {
-            let config = aiw_config::Config::load(&config_path)?;
+            let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
             let report = config.validate();
             if !report.is_ok() {
                 println!("{report}");
@@ -433,15 +472,15 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             Ok(())
         }
         SessionCommands::Doctor(args) => {
-            let config = aiw_config::Config::load(&config_path)?;
+            let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
             run_session_doctor(&config, &config_path, &state_dir, &args)
         }
     }
 }
 
-fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
+fn handle_note(cmd: NoteCommands, config_path: Option<&Path>, profile: Option<&str>) -> Result<()> {
     let config_path = resolve_config_path(config_path)?;
-    let config = aiw_config::Config::load(&config_path)?;
+    let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
     let report = config.validate();
     if !report.is_ok() {
         println!("{report}");
@@ -519,9 +558,9 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
     }
 }
 
-fn handle_adr(cmd: AdrCommands, config_path: Option<&Path>) -> Result<()> {
+fn handle_adr(cmd: AdrCommands, config_path: Option<&Path>, profile: Option<&str>) -> Result<()> {
     let config_path = resolve_config_path(config_path)?;
-    let config = aiw_config::Config::load(&config_path)?;
+    let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
     let report = config.validate();
     if !report.is_ok() {
         println!("{report}");
@@ -552,9 +591,13 @@ fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
     Ok(PathBuf::from(DEFAULT_CONFIG_FILE))
 }
 
-fn session_state_dir(config_path: &Path) -> Result<PathBuf> {
+fn session_state_dir(config_path: &Path, profile: Option<&str>) -> PathBuf {
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(base.join(".aiw"))
+    let mut dir = base.join(".aiw");
+    if let Some(name) = profile {
+        dir = dir.join(name);
+    }
+    dir
 }
 
 #[derive(Clone, Copy)]

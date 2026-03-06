@@ -10,6 +10,7 @@ clap = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 aiw-config = { path = "../config" }
 aiw-session = { path = "../session" }
 aiw-adr = { path = "../adr" }

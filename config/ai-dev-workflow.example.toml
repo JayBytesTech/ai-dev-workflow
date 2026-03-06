@@ -22,3 +22,14 @@ dev_logs_dir = "Dev Logs/AI Hub"
 adr_dir = "ADR/AI Hub"
 transcript_dir = "AI Sessions/raw/AI Hub"
 allowed_note_folders = ["Projects/AI Hub", "Research"]
+
+[profiles.ci]
+# Optional profile overrides selected with `--profile ci` or `AIW_PROFILE=ci`.
+# Useful for CI runners and automation paths.
+vault_path = "/path/to/ObsidianVault-CI"
+
+[profiles.ci.tools.codex]
+executable = "codex"
+
+[profiles.ci.projects.ai-hub]
+transcript_dir = "AI Sessions/raw/AI Hub/CI"

@@ -64,6 +64,58 @@ fn run_aiw(config: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
     cmd.assert()
 }
 
+fn write_profile_config(root: &Path) -> PathBuf {
+    let vault = root.join("vault");
+    let vault_ci = root.join("vault-ci");
+    let templates = vault.join("Templates");
+    let templates_ci = vault_ci.join("Templates");
+    fs::create_dir_all(&templates).expect("create templates dir");
+    fs::create_dir_all(&templates_ci).expect("create ci templates dir");
+    fs::write(templates.join("AIW_Dev_Log.md"), "base").expect("write base template");
+    fs::write(templates.join("AIW_ADR.md"), "base").expect("write base template");
+    fs::write(templates_ci.join("AIW_Dev_Log.md"), "ci").expect("write ci template");
+    fs::write(templates_ci.join("AIW_ADR.md"), "ci").expect("write ci template");
+
+    let config_path = root.join("ai-dev-workflow.toml");
+    let config = format!(
+        "vault_path = \"{}\"\n\
+templates_dir = \"Templates\"\n\
+dev_log_template = \"AIW_Dev_Log.md\"\n\
+adr_template = \"AIW_ADR.md\"\n\
+default_transcript_root = \"AI Sessions/raw\"\n\
+default_dev_log_root = \"Dev Logs\"\n\
+default_adr_root = \"ADR\"\n\
+\n\
+[tools.claude]\n\
+executable = \"printf\"\n\
+\n\
+[tools.gemini]\n\
+executable = \"printf\"\n\
+\n\
+[tools.codex]\n\
+executable = \"printf\"\n\
+\n\
+[projects.ai-hub]\n\
+display_name = \"AI Hub\"\n\
+repo_root = \"{}\"\n\
+dev_logs_dir = \"Dev Logs/AI Hub\"\n\
+adr_dir = \"ADR/AI Hub\"\n\
+transcript_dir = \"AI Sessions/raw/AI Hub\"\n\
+allowed_note_folders = [\"Projects/AI Hub\"]\n\
+\n\
+[profiles.ci]\n\
+vault_path = \"{}\"\n\
+\n\
+[profiles.ci.projects.ai-hub]\n\
+transcript_dir = \"AI Sessions/raw/AI Hub/CI\"\n",
+        escape_toml_string(vault.to_string_lossy().as_ref()),
+        escape_toml_string(root.to_string_lossy().as_ref()),
+        escape_toml_string(vault_ci.to_string_lossy().as_ref()),
+    );
+    fs::write(&config_path, config).expect("write config");
+    config_path
+}
+
 #[test]
 fn wrap_status_and_end_flow_creates_transcript_and_dev_log() {
     let temp = TempDir::new().expect("tempdir");
@@ -273,4 +325,23 @@ fn session_end_non_interactive_json_output_and_adr_flags() {
             .contains("ADR/AI Hub"),
         "adr path should be returned"
     );
+}
+
+#[test]
+fn config_show_resolved_applies_profile() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = write_profile_config(temp.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aiw"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--profile")
+        .arg("ci")
+        .args(["config", "show", "--resolved"])
+        .output()
+        .expect("run config show");
+    assert!(output.status.success(), "config show should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("vault-ci"));
+    assert!(stdout.contains("AI Sessions/raw/AI Hub/CI"));
 }

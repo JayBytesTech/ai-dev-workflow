@@ -47,6 +47,12 @@ Validate config:
 cargo run -p aiw -- config validate
 ```
 
+Show resolved config (after profile and environment overrides):
+
+```bash
+cargo run -p aiw -- --profile ci config show --resolved
+```
+
 List projects:
 
 ```bash
@@ -58,6 +64,7 @@ cargo run -p aiw -- projects list
 ```text
 aiw config init
 aiw config validate
+aiw config show [--resolved]
 
 aiw session start
 aiw session end
@@ -70,6 +77,8 @@ aiw note scan
 aiw adr create
 aiw projects list
 ```
+
+Use `--profile <name>` with any command to apply profile-specific overrides.
 
 ## Session Capture
 
