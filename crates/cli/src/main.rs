@@ -1,4 +1,7 @@
 use std::fs;
+use std::io;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -68,9 +71,13 @@ struct SessionStartArgs {
     tool_args: Vec<String>,
     #[arg(long, help = "Use a PTY for richer transcript capture when wrapping a tool")]
     pty: bool,
-    #[arg(long, value_name = "cols", default_value_t = 120, help = "PTY columns when using --pty")]
+    #[arg(long, help = "Disable the script(1) backend when using --pty (force native PTY)")]
+    no_script: bool,
+    #[arg(long, help = "Force the script(1) backend when using --pty")]
+    script: bool,
+    #[arg(long, value_name = "cols", default_value_t = default_pty_cols(), help = "PTY columns when using --pty")]
     pty_cols: u16,
-    #[arg(long, value_name = "rows", default_value_t = 30, help = "PTY rows when using --pty")]
+    #[arg(long, value_name = "rows", default_value_t = default_pty_rows(), help = "PTY rows when using --pty")]
     pty_rows: u16,
 }
 
@@ -114,6 +121,43 @@ struct AdrCreateArgs {
 #[derive(Subcommand)]
 enum ProjectsCommands {
     List,
+}
+
+fn default_pty_cols() -> u16 {
+    detect_terminal_size().map(|(cols, _)| cols).unwrap_or(120)
+}
+
+fn default_pty_rows() -> u16 {
+    detect_terminal_size().map(|(_, rows)| rows).unwrap_or(30)
+}
+
+fn detect_terminal_size() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        let fd = io::stdin().as_raw_fd();
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } != 0 {
+            return None;
+        }
+        if ws.ws_col == 0 || ws.ws_row == 0 {
+            return None;
+        }
+        return Some((ws.ws_col, ws.ws_row));
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn main() -> Result<()> {
@@ -204,11 +248,19 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                 let tool_kind = aiw_ai_tools::ToolKind::parse(&args.tool)?;
                 let adapter = aiw_ai_tools::ToolAdapter::from_config(&config, tool_kind)?;
                 println!("Launching tool: {}", adapter.executable);
+                let prefer_script = if args.no_script {
+                    false
+                } else if args.script {
+                    true
+                } else {
+                    !matches!(tool_kind, aiw_ai_tools::ToolKind::Codex)
+                };
                 let code = aiw_session::run_tool_with_transcript(
                     &adapter.executable,
                     &args.tool_args,
                     &state.transcript_path,
                     args.pty,
+                    prefer_script,
                     aiw_session::PtyConfig {
                         cols: args.pty_cols,
                         rows: args.pty_rows,
@@ -226,6 +278,12 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                 return Err(anyhow::anyhow!("config validation failed"));
             }
             let state = aiw_session::end_session(&store)?;
+            if let Err(err) = aiw_session::cleanup_transcript(&state.transcript_path) {
+                eprintln!(
+                    "[aiw] transcript cleanup skipped ({}): {err}",
+                    state.transcript_path.display()
+                );
+            }
             let project = config
                 .projects
                 .get(&state.project_key)

@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -173,7 +177,7 @@ pub fn write_dev_log(
 ) -> Result<PathBuf> {
     let templates_root = resolve_in_vault(&config.vault_path, &config.templates_dir)?;
     let store = TemplateStore::new(templates_root);
-    let template = store.load("Dev_Log_Template.md")?;
+    let template = store.load(&config.dev_log_template)?;
 
     let date = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut values = HashMap::new();
@@ -192,6 +196,14 @@ pub fn write_dev_log(
     values.insert("rationale", input.rationale);
     values.insert("follow_up_tasks", input.follow_up_tasks);
     values.insert("transcript_path", session.transcript_path.display().to_string());
+    values.insert(
+        "transcript_link",
+        format_obsidian_link(&config.vault_path, &session.transcript_path),
+    );
+    values.insert(
+        "transcript_excerpt",
+        read_transcript_excerpt(&session.transcript_path, 120, 8000),
+    );
 
     let rendered = render_template(&template, &values);
 
@@ -208,6 +220,42 @@ pub fn write_dev_log(
     Ok(path)
 }
 
+fn format_obsidian_link(vault_path: &Path, transcript_path: &Path) -> String {
+    match transcript_path.strip_prefix(vault_path) {
+        Ok(relative) => {
+            let normalized = relative.to_string_lossy().replace('\\', "/");
+            format!("[[{normalized}]]")
+        }
+        Err(_) => transcript_path.display().to_string(),
+    }
+}
+
+fn read_transcript_excerpt(path: &Path, max_lines: usize, max_chars: usize) -> String {
+    let raw = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => return format!("Transcript unavailable: {err}"),
+    };
+
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    let mut excerpt = lines.join("\n");
+    if excerpt.len() > max_chars {
+        let total_chars = excerpt.chars().count();
+        let keep_chars = max_chars.min(total_chars);
+        let skip_chars = total_chars.saturating_sub(keep_chars);
+        excerpt = excerpt.chars().skip(skip_chars).collect();
+        // Mark truncation so readers know this is not the full transcript.
+        excerpt.insert_str(0, "...(truncated)\n");
+    }
+    if excerpt.trim().is_empty() {
+        "Transcript is empty.".to_string()
+    } else {
+        excerpt
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PtyConfig {
     pub cols: u16,
@@ -219,9 +267,19 @@ pub fn run_tool_with_transcript(
     args: &[String],
     transcript_path: &Path,
     use_pty: bool,
+    prefer_script: bool,
     pty: PtyConfig,
 ) -> Result<i32> {
     if use_pty {
+        #[cfg(unix)]
+        if prefer_script {
+            match run_tool_with_transcript_script(executable, args, transcript_path) {
+                Ok(code) => return Ok(code),
+                Err(err) => eprintln!(
+                    "[aiw] script backend unavailable, falling back to native PTY: {err}"
+                ),
+            }
+        }
         return run_tool_with_transcript_pty(executable, args, transcript_path, pty);
     }
     run_tool_with_transcript_pipe(executable, args, transcript_path)
@@ -344,6 +402,7 @@ fn run_tool_with_transcript_pty(
         .master
         .take_writer()
         .with_context(|| "Failed to open PTY writer")?;
+    let _raw_mode_guard = TerminalRawModeGuard::new()?;
 
     let file = fs::OpenOptions::new()
         .create(true)
@@ -353,7 +412,7 @@ fn run_tool_with_transcript_pty(
     let file = Arc::new(Mutex::new(file));
 
     let out_handle = spawn_pty_reader(reader, file.clone());
-    let in_handle = thread::spawn(move || {
+    let _in_handle = thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0u8; 1024];
         loop {
@@ -374,13 +433,116 @@ fn run_tool_with_transcript_pty(
         .with_context(|| "Failed to wait for tool process")?;
 
     out_handle.join().ok();
-    in_handle.join().ok();
+    // Do not join the stdin forwarding thread here. It can block on stdin
+    // reads even after the child exits, which would hang wrapper shutdown.
 
     let code = status.exit_code() as i32;
     let mut file = file.lock().expect("transcript file lock poisoned");
     writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
 
     Ok(code)
+}
+
+#[cfg(unix)]
+fn run_tool_with_transcript_script(
+    executable: &str,
+    args: &[String],
+    transcript_path: &Path,
+) -> Result<i32> {
+    let _raw_mode_guard = TerminalRawModeGuard::new()?;
+    let command = build_script_command(executable, args);
+    let status = Command::new("script")
+        .arg("-q")
+        .arg("-f")
+        .arg("-e")
+        .arg("-c")
+        .arg(&command)
+        .arg(transcript_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .with_context(|| "Failed to start script backend")?;
+
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(-1);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
+    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+    Ok(code)
+}
+
+#[cfg(unix)]
+fn build_script_command(executable: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote(executable));
+    for arg in args {
+        parts.push(shell_quote(arg));
+    }
+    parts.join(" ")
+}
+
+#[cfg(unix)]
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = input.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+struct TerminalRawModeGuard {
+    #[cfg(unix)]
+    fd: i32,
+    #[cfg(unix)]
+    original: Option<libc::termios>,
+}
+
+impl TerminalRawModeGuard {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let fd = std::io::stdin().as_raw_fd();
+            let is_tty = unsafe { libc::isatty(fd) } == 1;
+            if !is_tty {
+                return Ok(Self { fd, original: None });
+            }
+
+            let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+                return Err(anyhow!("Failed to read terminal attributes"));
+            }
+            let original = termios;
+            unsafe { libc::cfmakeraw(&mut termios) };
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+                return Err(anyhow!("Failed to enable raw terminal mode"));
+            }
+
+            return Ok(Self {
+                fd,
+                original: Some(original),
+            });
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for TerminalRawModeGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(original) = self.original.as_ref() {
+            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, original) };
+        }
+    }
 }
 
 fn prepare_transcript(state: &SessionState) -> Result<()> {
@@ -427,9 +589,13 @@ fn spawn_tee<R: Read + Send + 'static>(
                 Ok(n) => {
                     let chunk = &buffer[..n];
                     let _ = if to_stdout {
-                        std::io::stdout().write_all(chunk)
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(chunk);
+                        out.flush()
                     } else {
-                        std::io::stderr().write_all(chunk)
+                        let mut out = std::io::stderr();
+                        let _ = out.write_all(chunk);
+                        out.flush()
                     };
                     if let Ok(mut file) = file.lock() {
                         let _ = file.write_all(chunk);
@@ -452,7 +618,9 @@ fn spawn_pty_reader<R: Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = &buffer[..n];
-                    let _ = std::io::stdout().write_all(chunk);
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(chunk);
+                    let _ = out.flush();
                     if let Ok(mut file) = file.lock() {
                         let _ = file.write_all(chunk);
                     }
@@ -461,4 +629,69 @@ fn spawn_pty_reader<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+pub fn cleanup_transcript(path: &Path) -> Result<()> {
+    let raw =
+        fs::read(path).with_context(|| format!("Failed to read transcript {}", path.display()))?;
+    let cleaned = strip_terminal_control_sequences(&raw);
+    fs::write(path, cleaned)
+        .with_context(|| format!("Failed to write transcript {}", path.display()))?;
+    Ok(())
+}
+
+fn strip_terminal_control_sequences(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let b = input[i];
+        if b == 0x1B {
+            if i + 1 >= input.len() {
+                break;
+            }
+            match input[i + 1] {
+                b'[' => {
+                    i += 2;
+                    while i < input.len() {
+                        let c = input[i];
+                        if (0x40..=0x7E).contains(&c) {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                b']' => {
+                    i += 2;
+                    while i < input.len() {
+                        if input[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if input[i] == 0x1B && i + 1 < input.len() && input[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        if b == b'\r' {
+            i += 1;
+            continue;
+        }
+        if b == b'\n' || b == b'\t' || (0x20..=0x7E).contains(&b) {
+            out.push(char::from(b));
+        }
+        i += 1;
+    }
+    out
 }
