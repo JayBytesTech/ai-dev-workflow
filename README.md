@@ -79,6 +79,18 @@ aiw session doctor --project ai-hub --tool codex
 aiw session doctor --project ai-hub --tool codex --repair
 ```
 
+Non-interactive session end (CI/script friendly):
+
+```bash
+aiw session end --non-interactive --output json \
+  --goal "Ship release prep" \
+  --summary "Completed smoke tests and docs updates" \
+  --decision "Use staged rollout" \
+  --rationale "Reduce rollout risk" \
+  --follow-up-task "prepare release notes" \
+  --no-adr
+```
+
 ## Templates
 
 Default templates live in `templates/` and are copied from the bootstrap package. The filenames are configurable via `dev_log_template` and `adr_template` in the TOML config:

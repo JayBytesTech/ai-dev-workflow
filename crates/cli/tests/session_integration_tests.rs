@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::str::contains;
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn write_test_config(root: &Path) -> PathBuf {
@@ -191,4 +192,85 @@ fn doctor_repair_recovers_stale_capturing_session() {
         .args(["session", "end"])
         .write_stdin("\n\n\n\n\nn\n");
     end_cmd.assert().success();
+}
+
+#[test]
+fn session_end_non_interactive_json_output_and_adr_flags() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = write_test_config(temp.path());
+
+    run_aiw(
+        &config,
+        &[
+            "session",
+            "start",
+            "--project",
+            "ai-hub",
+            "--tool",
+            "codex",
+            "--topic",
+            "json flow",
+        ],
+    )
+    .success();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aiw"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "session",
+            "end",
+            "--non-interactive",
+            "--output",
+            "json",
+            "--goal",
+            "Ship non-interactive mode",
+            "--summary",
+            "Implemented non-interactive session end",
+            "--decision",
+            "Use explicit CLI flags for automation",
+            "--rationale",
+            "Allow CI-safe execution with no prompts",
+            "--follow-up-task",
+            "add docs",
+            "--adr-title",
+            "Automate session end in CI",
+            "--adr-context",
+            "Need reproducible non-interactive workflow",
+            "--adr-options",
+            "interactive prompts vs explicit flags",
+            "--adr-decision",
+            "Use explicit flags and JSON output",
+            "--adr-consequences",
+            "Slightly longer command lines but scriptable",
+        ])
+        .output()
+        .expect("run session end");
+    assert!(output.status.success(), "session end should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let payload: Value = serde_json::from_str(&stdout).expect("json output");
+    assert_eq!(
+        payload["project"].as_str(),
+        Some("AI Hub"),
+        "project should be serialized"
+    );
+    assert_eq!(
+        payload["capture_status"].as_str(),
+        Some("flushed"),
+        "capture should be terminal"
+    );
+    assert!(
+        payload["dev_log_path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Dev Logs/AI Hub"),
+        "dev log path should be returned"
+    );
+    assert!(
+        payload["adr_path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ADR/AI Hub"),
+        "adr path should be returned"
+    );
 }

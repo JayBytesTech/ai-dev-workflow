@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONFIG_FILE: &str = "ai-dev-workflow.toml";
 
@@ -100,6 +100,52 @@ struct SessionEndArgs {
         help = "Generate dev-log fields from transcript and edit defaults"
     )]
     auto: bool,
+    #[arg(
+        long,
+        help = "Do not prompt for input; use flags and/or auto-generated values"
+    )]
+    non_interactive: bool,
+    #[arg(long, value_name = "text")]
+    goal: Option<String>,
+    #[arg(long, value_name = "text")]
+    summary: Option<String>,
+    #[arg(long, value_name = "text")]
+    decision: Option<String>,
+    #[arg(long, value_name = "text")]
+    rationale: Option<String>,
+    #[arg(long = "follow-up-task", value_name = "text")]
+    follow_up_task: Vec<String>,
+    #[arg(long, help = "Skip ADR creation entirely")]
+    no_adr: bool,
+    #[arg(long, value_name = "text")]
+    adr_title: Option<String>,
+    #[arg(long, value_name = "text")]
+    adr_context: Option<String>,
+    #[arg(long, value_name = "text")]
+    adr_options: Option<String>,
+    #[arg(long, value_name = "text")]
+    adr_decision: Option<String>,
+    #[arg(long, value_name = "text")]
+    adr_consequences: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Serialize)]
+struct SessionEndOutput {
+    session_id: String,
+    project: String,
+    tool: String,
+    capture_status: String,
+    transcript_path: String,
+    dev_log_path: String,
+    adr_path: Option<String>,
 }
 
 #[derive(Args)]
@@ -334,39 +380,36 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                 .get(&state.project_key)
                 .ok_or_else(|| anyhow::anyhow!("project not found: {}", state.project_key))?;
 
-            let input = if args.auto {
-                match generate_dev_log_input_from_transcript(&config, &state) {
-                    Ok(draft) => {
-                        println!(
-                            "Generated draft from transcript. Press Enter to keep a suggested value."
-                        );
-                        prompt_dev_log_input_with_defaults(&draft)?
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "[aiw] auto-generation failed, falling back to manual prompts: {err}"
-                        );
-                        prompt_dev_log_input()?
-                    }
-                }
-            } else {
-                prompt_dev_log_input()?
-            };
+            if args.no_adr
+                && (args.adr_title.is_some()
+                    || args.adr_context.is_some()
+                    || args.adr_options.is_some()
+                    || args.adr_decision.is_some()
+                    || args.adr_consequences.is_some())
+            {
+                return Err(anyhow::anyhow!(
+                    "ADR flags cannot be used together with --no-adr"
+                ));
+            }
+
+            let input = build_session_end_input(&config, &state, &args)?;
             let git_info = aiw_session::collect_git_info(project);
             let dev_log_path =
                 aiw_session::write_dev_log(&config, project, &state, input, git_info)?;
 
-            println!("Ended session: {}", state.id);
-            println!("Project: {}", state.project_display_name);
-            println!("Tool: {}", state.tool);
-            println!("Transcript: {}", state.transcript_path.display());
-            println!("Created dev log: {}", dev_log_path.display());
-
-            if prompt_yes_no("Create ADR? (y/N)")? {
-                let adr_input = prompt_adr_input(None)?;
-                let adr_path = aiw_adr::create_adr(&config, project, adr_input)?;
-                println!("Created ADR: {}", adr_path.display());
-            }
+            let adr_path = maybe_create_session_adr(&config, project, &args)?;
+            emit_session_end_output(
+                args.output,
+                SessionEndOutput {
+                    session_id: state.id,
+                    project: state.project_display_name,
+                    tool: state.tool,
+                    capture_status: state.capture_status.to_string(),
+                    transcript_path: state.transcript_path.display().to_string(),
+                    dev_log_path: dev_log_path.display().to_string(),
+                    adr_path: adr_path.map(|path| path.display().to_string()),
+                },
+            )?;
             Ok(())
         }
         SessionCommands::Status => {
@@ -930,6 +973,142 @@ fn prompt_dev_log_input_with_defaults(
         rationale,
         follow_up_tasks,
     })
+}
+
+fn build_session_end_input(
+    config: &aiw_config::Config,
+    state: &aiw_session::SessionState,
+    args: &SessionEndArgs,
+) -> Result<aiw_session::DevLogInput> {
+    let default_goal = state.topic.clone().unwrap_or_default();
+    let draft = if args.auto {
+        Some(generate_dev_log_input_from_transcript(config, state)?)
+    } else {
+        None
+    };
+
+    if args.non_interactive {
+        let mut input = draft.unwrap_or(aiw_session::DevLogInput {
+            goal: default_goal.clone(),
+            summary: String::new(),
+            decision: String::new(),
+            rationale: String::new(),
+            follow_up_tasks: String::new(),
+        });
+        if let Some(goal) = &args.goal {
+            input.goal = goal.clone();
+        } else if input.goal.trim().is_empty() {
+            input.goal = default_goal;
+        }
+        if let Some(summary) = &args.summary {
+            input.summary = summary.clone();
+        }
+        if let Some(decision) = &args.decision {
+            input.decision = decision.clone();
+        }
+        if let Some(rationale) = &args.rationale {
+            input.rationale = rationale.clone();
+        }
+        if !args.follow_up_task.is_empty() {
+            input.follow_up_tasks = format_follow_up_tasks(&args.follow_up_task);
+        }
+        return Ok(input);
+    }
+
+    if let Some(draft) = draft {
+        println!("Generated draft from transcript. Press Enter to keep a suggested value.");
+        return prompt_dev_log_input_with_defaults(&draft);
+    }
+    prompt_dev_log_input()
+}
+
+fn maybe_create_session_adr(
+    config: &aiw_config::Config,
+    project: &aiw_config::ProjectConfig,
+    args: &SessionEndArgs,
+) -> Result<Option<PathBuf>> {
+    if args.no_adr {
+        return Ok(None);
+    }
+
+    if let Some(input) = adr_input_from_flags(args)? {
+        let path = aiw_adr::create_adr(config, project, input)?;
+        return Ok(Some(path));
+    }
+
+    if args.non_interactive {
+        return Ok(None);
+    }
+
+    if prompt_yes_no("Create ADR? (y/N)")? {
+        let adr_input = prompt_adr_input(None)?;
+        let path = aiw_adr::create_adr(config, project, adr_input)?;
+        return Ok(Some(path));
+    }
+
+    Ok(None)
+}
+
+fn adr_input_from_flags(args: &SessionEndArgs) -> Result<Option<aiw_adr::AdrInput>> {
+    let any_adr_flags = args.adr_title.is_some()
+        || args.adr_context.is_some()
+        || args.adr_options.is_some()
+        || args.adr_decision.is_some()
+        || args.adr_consequences.is_some();
+    if !any_adr_flags {
+        return Ok(None);
+    }
+
+    let title = args
+        .adr_title
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--adr-title is required when using ADR flags"))?;
+    let context = args
+        .adr_context
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--adr-context is required when using ADR flags"))?;
+    let options = args
+        .adr_options
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--adr-options is required when using ADR flags"))?;
+    let decision = args
+        .adr_decision
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--adr-decision is required when using ADR flags"))?;
+    let consequences = args
+        .adr_consequences
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--adr-consequences is required when using ADR flags"))?;
+
+    Ok(Some(aiw_adr::AdrInput {
+        title,
+        context,
+        options,
+        decision,
+        consequences,
+    }))
+}
+
+fn emit_session_end_output(format: OutputFormat, output: SessionEndOutput) -> Result<()> {
+    match format {
+        OutputFormat::Text => {
+            println!("Ended session: {}", output.session_id);
+            println!("Project: {}", output.project);
+            println!("Tool: {}", output.tool);
+            println!("Capture status: {}", output.capture_status);
+            println!("Transcript: {}", output.transcript_path);
+            println!("Created dev log: {}", output.dev_log_path);
+            if let Some(adr_path) = output.adr_path {
+                println!("Created ADR: {}", adr_path);
+            }
+        }
+        OutputFormat::Json => {
+            let rendered =
+                serde_json::to_string_pretty(&output).context("Failed to serialize JSON output")?;
+            println!("{rendered}");
+        }
+    }
+    Ok(())
 }
 
 fn prompt_line(label: &str) -> Result<String> {
