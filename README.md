@@ -67,7 +67,7 @@ aiw session start --project ai-hub --tool claude --wrap
 Optional: pass tool arguments and use a PTY for richer TUI capture:
 
 ```bash
-aiw session start --project ai-hub --tool claude --wrap --pty --tool-args --model sonnet
+aiw session start --project ai-hub --tool claude --wrap --pty --pty-cols 140 --pty-rows 40 --tool-args --model sonnet
 ```
 
 ## Templates

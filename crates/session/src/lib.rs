@@ -208,14 +208,21 @@ pub fn write_dev_log(
     Ok(path)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PtyConfig {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 pub fn run_tool_with_transcript(
     executable: &str,
     args: &[String],
     transcript_path: &Path,
     use_pty: bool,
+    pty: PtyConfig,
 ) -> Result<i32> {
     if use_pty {
-        return run_tool_with_transcript_pty(executable, args, transcript_path);
+        return run_tool_with_transcript_pty(executable, args, transcript_path, pty);
     }
     run_tool_with_transcript_pipe(executable, args, transcript_path)
 }
@@ -306,12 +313,13 @@ fn run_tool_with_transcript_pty(
     executable: &str,
     args: &[String],
     transcript_path: &Path,
+    pty: PtyConfig,
 ) -> Result<i32> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 30,
-            cols: 120,
+            rows: pty.rows,
+            cols: pty.cols,
             pixel_width: 0,
             pixel_height: 0,
         })

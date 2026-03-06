@@ -63,6 +63,10 @@ struct SessionStartArgs {
     tool_args: Vec<String>,
     #[arg(long, help = "Use a PTY for richer transcript capture when wrapping a tool")]
     pty: bool,
+    #[arg(long, value_name = "cols", default_value_t = 120, help = "PTY columns when using --pty")]
+    pty_cols: u16,
+    #[arg(long, value_name = "rows", default_value_t = 30, help = "PTY rows when using --pty")]
+    pty_rows: u16,
 }
 
 #[derive(Subcommand)]
@@ -200,6 +204,10 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                     &args.tool_args,
                     &state.transcript_path,
                     args.pty,
+                    aiw_session::PtyConfig {
+                        cols: args.pty_cols,
+                        rows: args.pty_rows,
+                    },
                 )?;
                 println!("Tool exited with code {code}");
             }
@@ -307,11 +315,22 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
             let adapter = aiw_ai_tools::ToolAdapter::from_config(&config, tool_kind)?;
 
             let mut appended_blocks = String::new();
+            let mut processed = 0usize;
             for cmd in &commands {
+                let marker = build_note_marker(cmd);
+                if content.contains(&marker) {
+                    continue;
+                }
                 let prompt = build_note_prompt(&cmd.raw, &content);
                 let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
-                let block = format_note_result_block(&cmd.raw, &output.stdout, &output.stderr);
+                let block = format_note_result_block(cmd, &output.stdout, &output.stderr);
                 appended_blocks.push_str(&block);
+                processed += 1;
+            }
+
+            if processed == 0 {
+                println!("All commands already processed in {}", resolved.display());
+                return Ok(());
             }
 
             let mut updated = content;
@@ -321,7 +340,7 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
             updated.push_str(&appended_blocks);
             fs::write(&resolved, updated)
                 .with_context(|| format!("Failed to write note {}", resolved.display()))?;
-            println!("Processed {} command(s) in {}", commands.len(), resolved.display());
+            println!("Processed {} command(s) in {}", processed, resolved.display());
             Ok(())
         }
     }
@@ -427,14 +446,30 @@ fn build_note_prompt(command: &str, content: &str) -> String {
     )
 }
 
-fn format_note_result_block(command: &str, stdout: &str, stderr: &str) -> String {
+fn format_note_result_block(
+    cmd: &aiw_obsidian::NoteCommandMatch,
+    stdout: &str,
+    stderr: &str,
+) -> String {
     let mut block = String::new();
     block.push_str("\n---\n");
-    block.push_str(&format!("**AI Result ({command})**\n\n"));
-    if !stdout.trim().is_empty() {
-        block.push_str("```text\n");
-        block.push_str(stdout.trim());
-        block.push_str("\n```\n");
+    block.push_str(&build_note_marker(cmd));
+    block.push('\n');
+    block.push_str(&format!("**AI Result ({})**\n\n", note_command_label(&cmd.command)));
+    match cmd.command {
+        aiw_obsidian::NoteCommand::ExtractTasks => {
+            let body = format_tasks(stdout);
+            block.push_str(body.trim());
+            block.push('\n');
+        }
+        _ => {
+            let body = stdout.trim();
+            if !body.is_empty() {
+                block.push_str("```text\n");
+                block.push_str(body);
+                block.push_str("\n```\n");
+            }
+        }
     }
     if !stderr.trim().is_empty() {
         block.push_str("\n**Tool Stderr**\n\n```text\n");
@@ -442,6 +477,58 @@ fn format_note_result_block(command: &str, stdout: &str, stderr: &str) -> String
         block.push_str("\n```\n");
     }
     block
+}
+
+fn format_tasks(stdout: &str) -> String {
+    let mut tasks = Vec::new();
+    for line in stdout.lines() {
+        let cleaned = line
+            .trim()
+            .trim_start_matches("- [ ]")
+            .trim_start_matches("- [x]")
+            .trim_start_matches("- [X]")
+            .trim_start_matches("-")
+            .trim_start_matches("*")
+            .trim_start_matches("•")
+            .trim_start_matches(char::is_numeric)
+            .trim_start_matches(|c: char| c == '.' || c == ')')
+            .trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        tasks.push(format!("- [ ] {cleaned}"));
+    }
+    if tasks.is_empty() {
+        tasks.push("- [ ] (no tasks extracted)".to_string());
+    }
+    tasks.join("\n")
+}
+
+fn build_note_marker(cmd: &aiw_obsidian::NoteCommandMatch) -> String {
+    let mut input = String::new();
+    input.push_str(cmd.raw.as_str());
+    input.push('|');
+    input.push_str(cmd.line.to_string().as_str());
+    let hash = stable_hash(&input);
+    format!("<!-- AIW_RESULT: {} {} -->", note_command_label(&cmd.command), hash)
+}
+
+fn stable_hash(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn note_command_label(command: &aiw_obsidian::NoteCommand) -> &'static str {
+    match command {
+        aiw_obsidian::NoteCommand::Summarize => "summarize",
+        aiw_obsidian::NoteCommand::Critique => "critique",
+        aiw_obsidian::NoteCommand::Research => "research",
+        aiw_obsidian::NoteCommand::ExtractTasks => "extract-tasks",
+    }
 }
 
 fn write_sample_config(path: &Path) -> Result<()> {
