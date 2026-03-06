@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "crates/cli",
+  "crates/config",
+  "crates/session",
+  "crates/ai_tools",
+  "crates/obsidian",
+  "crates/adr",
+  "crates/templates",
+]
+resolver = "2"

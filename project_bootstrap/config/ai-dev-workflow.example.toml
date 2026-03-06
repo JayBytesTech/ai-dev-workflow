@@ -1,0 +1,22 @@
+vault_path = "/path/to/ObsidianVault"
+templates_dir = "Templates"
+default_transcript_root = "AI Sessions/raw"
+default_dev_log_root = "Dev Logs"
+default_adr_root = "ADR"
+
+[tools.claude]
+executable = "claude-code"
+
+[tools.gemini]
+executable = "gemini"
+
+[tools.codex]
+executable = "codex"
+
+[projects.ai-hub]
+display_name = "AI Hub"
+repo_root = "/path/to/projects/ai-hub"
+dev_logs_dir = "Dev Logs/AI Hub"
+adr_dir = "ADR/AI Hub"
+transcript_dir = "AI Sessions/raw/AI Hub"
+allowed_note_folders = ["Projects/AI Hub", "Research"]

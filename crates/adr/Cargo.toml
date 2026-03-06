@@ -1,0 +1,11 @@
+[package]
+name = "aiw-adr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+aiw-config = { path = "../config" }
+aiw-templates = { path = "../templates" }
