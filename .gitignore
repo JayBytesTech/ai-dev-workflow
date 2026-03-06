@@ -1,0 +1,4 @@
+/target/
+/.aiw/
+*.log
+.DS_Store
