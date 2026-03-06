@@ -12,3 +12,7 @@ serde_json = { workspace = true }
 aiw-config = { path = "../config" }
 aiw-templates = { path = "../templates" }
 portable-pty = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,6 +13,7 @@ dependencies = [
  "aiw-session",
  "anyhow",
  "clap",
+ "libc",
 ]
 
 [[package]]
@@ -62,9 +63,11 @@ dependencies = [
  "aiw-templates",
  "anyhow",
  "chrono",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

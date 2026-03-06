@@ -695,3 +695,150 @@ fn strip_terminal_control_sequences(input: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use aiw_config::{ProjectConfig, ToolConfig, ToolsConfig};
+
+    fn build_config(vault: &Path) -> Config {
+        let tool = ToolConfig {
+            executable: "echo".to_string(),
+        };
+
+        Config {
+            vault_path: vault.to_path_buf(),
+            templates_dir: PathBuf::from("Templates"),
+            dev_log_template: PathBuf::from("AIW_Dev_Log.md"),
+            adr_template: PathBuf::from("AIW_ADR.md"),
+            default_transcript_root: PathBuf::from("AI Sessions/raw"),
+            default_dev_log_root: PathBuf::from("Dev Logs"),
+            default_adr_root: PathBuf::from("ADR"),
+            tools: ToolsConfig {
+                claude: tool.clone(),
+                gemini: tool.clone(),
+                codex: tool,
+            },
+            projects: HashMap::new(),
+        }
+    }
+
+    fn build_project() -> ProjectConfig {
+        ProjectConfig {
+            display_name: "AI Hub".to_string(),
+            repo_root: None,
+            dev_logs_dir: PathBuf::from("Dev Logs/AI Hub"),
+            adr_dir: PathBuf::from("ADR/AI Hub"),
+            transcript_dir: PathBuf::from("AI Sessions/raw/AI Hub"),
+            allowed_note_folders: vec![PathBuf::from("Projects/AI Hub")],
+        }
+    }
+
+    fn build_session(transcript_path: PathBuf) -> SessionState {
+        SessionState {
+            id: "20260306150000".to_string(),
+            project_key: "ai-hub".to_string(),
+            project_display_name: "AI Hub".to_string(),
+            tool: "codex".to_string(),
+            topic: Some("regression test".to_string()),
+            start_time_utc: Utc::now(),
+            cwd: PathBuf::from("/tmp"),
+            transcript_path,
+        }
+    }
+
+    fn build_input() -> DevLogInput {
+        DevLogInput {
+            goal: "Ship fixes".to_string(),
+            summary: "Summary text".to_string(),
+            decision: "Decision text".to_string(),
+            rationale: "Rationale text".to_string(),
+            follow_up_tasks: "- [ ] verify".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_dev_log_renders_transcript_link_and_excerpt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path();
+        fs::create_dir_all(vault.join("Templates")).expect("templates dir");
+        fs::write(
+            vault.join("Templates/AIW_Dev_Log.md"),
+            "Transcript link: {{transcript_link}}\nExcerpt:\n{{transcript_excerpt}}\nSummary: {{summary}}\n",
+        )
+        .expect("template");
+
+        let transcript = vault.join("AI Sessions/raw/AI Hub/2026-03-06/session-150000.log");
+        fs::create_dir_all(transcript.parent().expect("transcript parent")).expect("mkdir");
+        fs::write(
+            &transcript,
+            "[aiw] session start\nuser: test prompt\nassistant: streamed response\n",
+        )
+        .expect("transcript");
+
+        let config = build_config(vault);
+        let project = build_project();
+        let session = build_session(transcript);
+        let path = write_dev_log(
+            &config,
+            &project,
+            &session,
+            build_input(),
+            GitInfo::default(),
+        )
+        .expect("write_dev_log");
+
+        let rendered = fs::read_to_string(path).expect("read log");
+        assert!(rendered.contains("[[AI Sessions/raw/AI Hub/2026-03-06/session-150000.log]]"));
+        assert!(rendered.contains("assistant: streamed response"));
+        assert!(rendered.contains("Summary: Summary text"));
+        assert!(!rendered.contains("{{transcript_link}}"));
+        assert!(!rendered.contains("{{transcript_excerpt}}"));
+    }
+
+    #[test]
+    fn write_dev_log_handles_missing_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = dir.path();
+        fs::create_dir_all(vault.join("Templates")).expect("templates dir");
+        fs::write(
+            vault.join("Templates/AIW_Dev_Log.md"),
+            "Link: {{transcript_link}}\n{{transcript_excerpt}}\n",
+        )
+        .expect("template");
+
+        let missing = vault.join("AI Sessions/raw/AI Hub/2026-03-06/session-missing.log");
+        let config = build_config(vault);
+        let project = build_project();
+        let session = build_session(missing);
+        let path = write_dev_log(
+            &config,
+            &project,
+            &session,
+            build_input(),
+            GitInfo::default(),
+        )
+        .expect("write_dev_log");
+
+        let rendered = fs::read_to_string(path).expect("read log");
+        assert!(rendered.contains("[[AI Sessions/raw/AI Hub/2026-03-06/session-missing.log]]"));
+        assert!(rendered.contains("Transcript unavailable:"));
+    }
+
+    #[test]
+    fn cleanup_transcript_strips_terminal_control_sequences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.log");
+        fs::write(
+            &path,
+            b"hello\r\n\x1b[31mred\x1b[0m text\n\x1b]0;window-title\x07done\n",
+        )
+        .expect("write");
+
+        cleanup_transcript(&path).expect("cleanup");
+        let cleaned = fs::read_to_string(path).expect("read");
+        assert_eq!(cleaned, "hello\nred text\ndone\n");
+    }
+}
