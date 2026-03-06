@@ -59,6 +59,10 @@ struct SessionStartArgs {
     cwd: Option<PathBuf>,
     #[arg(long, help = "Run the tool and capture stdout/stderr to the transcript file")]
     wrap: bool,
+    #[arg(long, value_name = "arg", num_args = 1.., help = "Arguments to pass to the tool when using --wrap")]
+    tool_args: Vec<String>,
+    #[arg(long, help = "Use a PTY for richer transcript capture when wrapping a tool")]
+    pty: bool,
 }
 
 #[derive(Subcommand)]
@@ -193,7 +197,9 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                 println!("Launching tool: {}", adapter.executable);
                 let code = aiw_session::run_tool_with_transcript(
                     &adapter.executable,
+                    &args.tool_args,
                     &state.transcript_path,
+                    args.pty,
                 )?;
                 println!("Tool exited with code {code}");
             }

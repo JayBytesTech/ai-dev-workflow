@@ -3,7 +3,7 @@
 `ai-dev-workflow` is a Rust CLI that captures AI-assisted development sessions and stores transcripts, dev logs, and ADRs inside an Obsidian vault.
 
 ## Status
-Stage 8 (partial): config parsing/validation, session start/end/status, dev log generation, ADR creation, note scan detection, AI tool adapters, note processing, and a basic transcript capture wrapper are implemented.
+Stage 8 (partial): config parsing/validation, session start/end/status, dev log generation, ADR creation, note scan detection, AI tool adapters, note processing, and a transcript capture wrapper (pipe or PTY) are implemented.
 
 ## Build
 
@@ -54,6 +54,20 @@ aiw note scan
 
 aiw adr create
 aiw projects list
+```
+
+## Session Capture
+
+Wrap a tool session and capture transcripts:
+
+```bash
+aiw session start --project ai-hub --tool claude --wrap
+```
+
+Optional: pass tool arguments and use a PTY for richer TUI capture:
+
+```bash
+aiw session start --project ai-hub --tool claude --wrap --pty --tool-args --model sonnet
 ```
 
 ## Templates

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use aiw_config::{resolve_in_vault, Config, ProjectConfig};
 use aiw_templates::{render_template, TemplateStore};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const STATE_FILE_NAME: &str = "session.json";
 
@@ -207,39 +208,16 @@ pub fn write_dev_log(
     Ok(path)
 }
 
-pub fn run_tool_with_transcript(executable: &str, transcript_path: &Path) -> Result<i32> {
-    let mut child = Command::new(executable)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Failed to start tool: {executable}"))?;
-
-    let stdout = child.stdout.take().context("Failed to capture stdout")?;
-    let stderr = child.stderr.take().context("Failed to capture stderr")?;
-
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(transcript_path)
-        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
-    let file = Arc::new(Mutex::new(file));
-
-    let out_handle = spawn_tee(stdout, file.clone(), true);
-    let err_handle = spawn_tee(stderr, file.clone(), false);
-
-    let status = child
-        .wait()
-        .with_context(|| "Failed to wait for tool process")?;
-
-    out_handle.join().ok();
-    err_handle.join().ok();
-
-    let code = status.code().unwrap_or(-1);
-    let mut file = file.lock().expect("transcript file lock poisoned");
-    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
-
-    Ok(code)
+pub fn run_tool_with_transcript(
+    executable: &str,
+    args: &[String],
+    transcript_path: &Path,
+    use_pty: bool,
+) -> Result<i32> {
+    if use_pty {
+        return run_tool_with_transcript_pty(executable, args, transcript_path);
+    }
+    run_tool_with_transcript_pipe(executable, args, transcript_path)
 }
 
 fn normalize_tool(tool: &str) -> Result<&'static str> {
@@ -282,6 +260,119 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_tool_with_transcript_pipe(
+    executable: &str,
+    args: &[String],
+    transcript_path: &Path,
+) -> Result<i32> {
+    let mut child = Command::new(executable)
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to start tool: {executable}"))?;
+
+    let stdout = child.stdout.take().context("Failed to capture stdout")?;
+    let stderr = child.stderr.take().context("Failed to capture stderr")?;
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
+    let file = Arc::new(Mutex::new(file));
+
+    let out_handle = spawn_tee(stdout, file.clone(), true);
+    let err_handle = spawn_tee(stderr, file.clone(), false);
+
+    let status = child
+        .wait()
+        .with_context(|| "Failed to wait for tool process")?;
+
+    out_handle.join().ok();
+    err_handle.join().ok();
+
+    let code = status.code().unwrap_or(-1);
+    let mut file = file.lock().expect("transcript file lock poisoned");
+    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+
+    Ok(code)
+}
+
+fn run_tool_with_transcript_pty(
+    executable: &str,
+    args: &[String],
+    transcript_path: &Path,
+) -> Result<i32> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .with_context(|| "Failed to open PTY")?;
+
+    let mut cmd = CommandBuilder::new(executable);
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("Failed to start tool: {executable}"))?;
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .with_context(|| "Failed to clone PTY reader")?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .with_context(|| "Failed to open PTY writer")?;
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .with_context(|| format!("Failed to open transcript {}", transcript_path.display()))?;
+    let file = Arc::new(Mutex::new(file));
+
+    let out_handle = spawn_pty_reader(reader, file.clone());
+    let in_handle = thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .with_context(|| "Failed to wait for tool process")?;
+
+    out_handle.join().ok();
+    in_handle.join().ok();
+
+    let code = status.code().unwrap_or(-1);
+    let mut file = file.lock().expect("transcript file lock poisoned");
+    writeln!(file, "\n\n[aiw] tool exited with code {code}\n").ok();
+
+    Ok(code)
 }
 
 fn prepare_transcript(state: &SessionState) -> Result<()> {
@@ -332,6 +423,28 @@ fn spawn_tee<R: Read + Send + 'static>(
                     } else {
                         std::io::stderr().write_all(chunk)
                     };
+                    if let Ok(mut file) = file.lock() {
+                        let _ = file.write_all(chunk);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn spawn_pty_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    file: Arc<Mutex<fs::File>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = &buffer[..n];
+                    let _ = std::io::stdout().write_all(chunk);
                     if let Ok(mut file) = file.lock() {
                         let _ = file.write_all(chunk);
                     }
