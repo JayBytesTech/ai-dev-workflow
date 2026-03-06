@@ -317,13 +317,14 @@ fn handle_note(cmd: NoteCommands, config_path: Option<&Path>) -> Result<()> {
             let mut appended_blocks = String::new();
             let mut processed = 0usize;
             for cmd in &commands {
-                let marker = build_note_marker(cmd);
+                let marker = build_note_marker(cmd, &content);
                 if content.contains(&marker) {
                     continue;
                 }
                 let prompt = build_note_prompt(&cmd.raw, &content);
                 let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
-                let block = format_note_result_block(cmd, &output.stdout, &output.stderr);
+                let block =
+                    format_note_result_block(cmd, &marker, &output.stdout, &output.stderr);
                 appended_blocks.push_str(&block);
                 processed += 1;
             }
@@ -448,12 +449,14 @@ fn build_note_prompt(command: &str, content: &str) -> String {
 
 fn format_note_result_block(
     cmd: &aiw_obsidian::NoteCommandMatch,
+    marker: &str,
     stdout: &str,
     stderr: &str,
 ) -> String {
     let mut block = String::new();
     block.push_str("\n---\n");
-    block.push_str(&build_note_marker(cmd));
+    block.push_str("## AIW Results\n\n");
+    block.push_str(marker);
     block.push('\n');
     block.push_str(&format!("**AI Result ({})**\n\n", note_command_label(&cmd.command)));
     match cmd.command {
@@ -504,11 +507,13 @@ fn format_tasks(stdout: &str) -> String {
     tasks.join("\n")
 }
 
-fn build_note_marker(cmd: &aiw_obsidian::NoteCommandMatch) -> String {
+fn build_note_marker(cmd: &aiw_obsidian::NoteCommandMatch, note_content: &str) -> String {
     let mut input = String::new();
     input.push_str(cmd.raw.as_str());
     input.push('|');
     input.push_str(cmd.line.to_string().as_str());
+    input.push('|');
+    input.push_str(&stable_hash(note_content).to_string());
     let hash = stable_hash(&input);
     format!("<!-- AIW_RESULT: {} {} -->", note_command_label(&cmd.command), hash)
 }
