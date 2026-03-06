@@ -54,6 +54,55 @@ allowed_note_folders = [\"Projects/AI Hub\"]\n",
     config_path
 }
 
+fn write_test_config_with_claude(root: &Path, claude_exe: &Path) -> PathBuf {
+    let vault = root.join("vault");
+    let templates = vault.join("Templates");
+    fs::create_dir_all(&templates).expect("create templates dir");
+    fs::write(
+        templates.join("AIW_Dev_Log.md"),
+        "# {{project_display_name}}\n{{summary}}\n{{transcript_link}}\n{{transcript_excerpt}}\n",
+    )
+    .expect("write dev log template");
+    fs::write(
+        templates.join("AIW_ADR.md"),
+        "# {{title}}\n## Context\n{{context}}\n## Decision\n{{decision}}\n",
+    )
+    .expect("write adr template");
+
+    let config_path = root.join("ai-dev-workflow.toml");
+    let config = format!(
+        "vault_path = \"{}\"\n\
+templates_dir = \"Templates\"\n\
+dev_log_template = \"AIW_Dev_Log.md\"\n\
+adr_template = \"AIW_ADR.md\"\n\
+default_transcript_root = \"AI Sessions/raw\"\n\
+default_dev_log_root = \"Dev Logs\"\n\
+default_adr_root = \"ADR\"\n\
+\n\
+[tools.claude]\n\
+executable = \"{}\"\n\
+\n\
+[tools.gemini]\n\
+executable = \"printf\"\n\
+\n\
+[tools.codex]\n\
+executable = \"printf\"\n\
+\n\
+[projects.ai-hub]\n\
+display_name = \"AI Hub\"\n\
+repo_root = \"{}\"\n\
+dev_logs_dir = \"Dev Logs/AI Hub\"\n\
+adr_dir = \"ADR/AI Hub\"\n\
+transcript_dir = \"AI Sessions/raw/AI Hub\"\n\
+allowed_note_folders = [\"Projects/AI Hub\"]\n",
+        escape_toml_string(vault.to_string_lossy().as_ref()),
+        escape_toml_string(claude_exe.to_string_lossy().as_ref()),
+        escape_toml_string(root.to_string_lossy().as_ref()),
+    );
+    fs::write(&config_path, config).expect("write config");
+    config_path
+}
+
 fn escape_toml_string(input: &str) -> String {
     input.replace('\\', "\\\\").replace('\"', "\\\"")
 }
@@ -324,6 +373,160 @@ fn session_end_non_interactive_json_output_and_adr_flags() {
             .unwrap_or_default()
             .contains("ADR/AI Hub"),
         "adr path should be returned"
+    );
+}
+
+#[test]
+fn session_end_auto_adr_non_interactive_uses_auto_tool() {
+    let temp = TempDir::new().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let tool_path = bin_dir.join("auto-adr-tool.sh");
+    fs::write(
+        &tool_path,
+        "#!/bin/sh\ncat > /dev/null\nprintf '{\"title\":\"Auto ADR\",\"context\":\"ctx\",\"options\":\"- A\",\"decision\":\"dec\",\"consequences\":\"cons\"}'\n",
+    )
+    .expect("write tool script");
+    let mut perms = fs::metadata(&tool_path).expect("metadata").permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(&tool_path, perms).expect("set perms");
+    }
+
+    let config = write_test_config_with_claude(temp.path(), &tool_path);
+
+    run_aiw(
+        &config,
+        &[
+            "session",
+            "start",
+            "--project",
+            "ai-hub",
+            "--tool",
+            "codex",
+            "--topic",
+            "auto adr",
+        ],
+    )
+    .success();
+
+    let state_path = temp.path().join(".aiw").join("session.json");
+    let state_raw = fs::read_to_string(&state_path).expect("read session state");
+    let state_json: Value = serde_json::from_str(&state_raw).expect("parse session state");
+    let transcript_path = state_json["transcript_path"]
+        .as_str()
+        .expect("transcript path");
+    let transcript_path = PathBuf::from(transcript_path);
+    if let Some(parent) = transcript_path.parent() {
+        fs::create_dir_all(parent).expect("create transcript dir");
+    }
+    fs::write(&transcript_path, "session content").expect("write transcript");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aiw"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "session",
+            "end",
+            "--non-interactive",
+            "--output",
+            "json",
+            "--auto-adr",
+            "--auto-tool",
+            "claude",
+        ])
+        .output()
+        .expect("run session end");
+    assert!(output.status.success(), "session end should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let payload: Value = serde_json::from_str(&stdout).expect("json output");
+    assert!(
+        payload["adr_path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ADR/AI Hub"),
+        "adr path should be returned"
+    );
+}
+
+#[test]
+fn session_end_auto_adr_interactive_accepts_defaults() {
+    let temp = TempDir::new().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let tool_path = bin_dir.join("auto-adr-tool.sh");
+    fs::write(
+        &tool_path,
+        "#!/bin/sh\ncat > /dev/null\nprintf '{\"title\":\"Auto ADR\",\"context\":\"ctx\",\"options\":\"- A\",\"decision\":\"dec\",\"consequences\":\"cons\"}'\n",
+    )
+    .expect("write tool script");
+    let mut perms = fs::metadata(&tool_path).expect("metadata").permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        fs::set_permissions(&tool_path, perms).expect("set perms");
+    }
+
+    let config = write_test_config_with_claude(temp.path(), &tool_path);
+
+    run_aiw(
+        &config,
+        &[
+            "session",
+            "start",
+            "--project",
+            "ai-hub",
+            "--tool",
+            "codex",
+            "--topic",
+            "auto adr interactive",
+        ],
+    )
+    .success();
+
+    let state_path = temp.path().join(".aiw").join("session.json");
+    let state_raw = fs::read_to_string(&state_path).expect("read session state");
+    let state_json: Value = serde_json::from_str(&state_raw).expect("parse session state");
+    let transcript_path = state_json["transcript_path"]
+        .as_str()
+        .expect("transcript path");
+    let transcript_path = PathBuf::from(transcript_path);
+    if let Some(parent) = transcript_path.parent() {
+        fs::create_dir_all(parent).expect("create transcript dir");
+    }
+    fs::write(&transcript_path, "session content").expect("write transcript");
+
+    let mut end_cmd = Command::new(env!("CARGO_BIN_EXE_aiw"));
+    end_cmd
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "session",
+            "end",
+            "--auto-adr",
+            "--auto-tool",
+            "claude",
+        ])
+        .write_stdin("\n\n\n\n\n\n\n\n\n\n");
+    let output = end_cmd.output().expect("run session end");
+    assert!(output.status.success(), "session end should succeed");
+    let adr_dir = temp.path().join("vault").join("ADR").join("AI Hub");
+    let mut entries = fs::read_dir(&adr_dir)
+        .expect("read adr dir")
+        .filter_map(|entry| entry.ok())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    let adr_path = entries
+        .last()
+        .expect("adr file")
+        .path();
+    let adr_body = fs::read_to_string(&adr_path).expect("read adr");
+    assert!(
+        adr_body.contains("Auto ADR"),
+        "adr should use auto-generated defaults"
     );
 }
 

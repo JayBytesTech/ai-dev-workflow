@@ -17,6 +17,26 @@ At the end:
 aiw session end
 ```
 
+Optional auto-generation (uses transcript to draft dev-log fields):
+```bash
+aiw session end --auto
+```
+
+If the session tool is `codex`, use another tool for auto-generation:
+```bash
+aiw session end --auto --auto-tool claude
+```
+
+Optional auto-generation of ADR fields:
+```bash
+aiw session end --auto-adr
+```
+
+Use a different tool for ADR auto-generation:
+```bash
+aiw session end --auto-adr --auto-tool claude
+```
+
 The tool generates:
 - raw transcript path
 - dev log markdown

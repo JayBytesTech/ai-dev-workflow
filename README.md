@@ -114,6 +114,32 @@ aiw session end --non-interactive --output json \
   --no-adr
 ```
 
+Auto-generate dev-log fields from the transcript:
+
+```bash
+aiw session end --auto
+```
+
+Use a different tool for auto-generation (e.g., keep `codex` for the session but use `claude` for auto):
+
+```bash
+aiw session end --auto --auto-tool claude
+```
+
+Note: auto-generation is not supported for `codex` and will fall back to manual prompts unless `--auto-tool` is provided.
+
+Auto-generate ADR fields from the transcript:
+
+```bash
+aiw session end --auto-adr
+```
+
+Auto-generate ADR fields with an explicit tool:
+
+```bash
+aiw session end --auto-adr --auto-tool claude
+```
+
 ## Templates
 
 Default templates live in `templates/` and are copied from the bootstrap package. The filenames are configurable via `dev_log_template` and `adr_template` in the TOML config:

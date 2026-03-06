@@ -18,6 +18,7 @@ This package is the from-scratch bootstrap for `ai-dev-workflow`, a Rust-based w
 - Session logging with transcript capture
 - Dev log generation into Obsidian
 - Optional ADR creation prompt
+- Auto-generation for dev logs and ADRs (`--auto`, `--auto-adr`)
 - Inline Obsidian AI note commands
 - Task extraction into markdown
 

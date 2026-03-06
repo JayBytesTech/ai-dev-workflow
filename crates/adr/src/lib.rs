@@ -30,10 +30,7 @@ pub fn create_adr(config: &Config, project: &ProjectConfig, input: AdrInput) -> 
     values.insert("adr_number", format!("{adr_number:04}"));
     values.insert("title", input.title.clone());
     values.insert("date", date);
-    values.insert(
-        "project_display_name",
-        project.display_name.clone(),
-    );
+    values.insert("project_display_name", project.display_name.clone());
     values.insert("context", input.context);
     values.insert("options", input.options);
     values.insert("decision", input.decision);
@@ -41,11 +38,7 @@ pub fn create_adr(config: &Config, project: &ProjectConfig, input: AdrInput) -> 
 
     let rendered = render_template(&template, &values);
 
-    let filename = format!(
-        "ADR-{:04}-{}.md",
-        adr_number,
-        slugify(&input.title)
-    );
+    let filename = format!("ADR-{:04}-{}.md", adr_number, slugify(&input.title));
     let path = adr_root.join(filename);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

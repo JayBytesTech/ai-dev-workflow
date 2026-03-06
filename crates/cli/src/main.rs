@@ -114,6 +114,17 @@ struct SessionEndArgs {
     auto: bool,
     #[arg(
         long,
+        help = "Auto-generate ADR fields from transcript"
+    )]
+    auto_adr: bool,
+    #[arg(
+        long = "auto-tool",
+        value_name = "tool",
+        help = "Tool to use for auto-generation (overrides session tool)"
+    )]
+    auto_tool: Option<String>,
+    #[arg(
+        long,
         help = "Do not prompt for input; use flags and/or auto-generated values"
     )]
     non_interactive: bool,
@@ -252,7 +263,14 @@ fn detect_terminal_size() -> Option<(u16, u16)> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        emit_error_with_hints(&err);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let profile = cli.profile.as_deref();
     match cli.command {
@@ -262,6 +280,75 @@ fn main() -> Result<()> {
         Commands::Note(cmd) => handle_note(cmd, cli.config.as_deref(), profile),
         Commands::Adr(cmd) => handle_adr(cmd, cli.config.as_deref(), profile),
     }
+}
+
+fn emit_error_with_hints(err: &anyhow::Error) {
+    eprintln!("Error: {err}");
+    let mut chain = err.chain();
+    let _ = chain.next();
+    let mut has_causes = false;
+    for cause in chain {
+        if !has_causes {
+            eprintln!("Caused by:");
+            has_causes = true;
+        }
+        eprintln!("- {cause}");
+    }
+
+    let hints = error_hints(err);
+    if !hints.is_empty() {
+        for hint in hints {
+            eprintln!("Hint: {hint}");
+        }
+    }
+}
+
+fn error_hints(err: &anyhow::Error) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    let mut push = |hint: &'static str| {
+        if !hints.contains(&hint) {
+            hints.push(hint);
+        }
+    };
+
+    let messages: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+    let joined = messages.join(" | ");
+
+    if joined.contains("Failed to read config at") {
+        push("Create a config with `aiw config init` or pass `--config <path>`.");
+    }
+    if joined.contains("Failed to parse TOML config") {
+        push("Fix TOML syntax and re-run `aiw config validate`.");
+    }
+    if joined.contains("profile not found in config") {
+        push("Use `--profile <name>` that exists or add it under `[profiles]` in the config.");
+    }
+    if joined.contains("config validation failed") {
+        push("Run `aiw config validate` to see detailed validation errors.");
+    }
+    if joined.contains("project not found:") {
+        push("Run `aiw projects list` and choose a valid `--project` value.");
+    }
+    if joined.contains("unsupported tool:") {
+        push("Supported tools: `claude`, `gemini`, `codex`.");
+    }
+    if joined.contains("tool executable is empty:") {
+        push("Set the tool executable path in your config under `[tools]`.");
+    }
+    if joined.contains("Failed to spawn") {
+        push("Verify the tool executable exists and is on your PATH (or set an absolute path).");
+    }
+    if joined.contains("note path is not within allowed folders") {
+        push("Choose a note path under `allowed_note_folders` or update the config.");
+    }
+    if joined.contains("Failed to read note") {
+        push("Confirm the note path exists under the project vault and is readable.");
+    }
+    if joined.contains("Failed to write note") {
+        push("Confirm the note path is writable and not locked by another process.");
+    }
+
+    hints
 }
 
 fn handle_config(
@@ -424,7 +511,8 @@ fn handle_session(
                     || args.adr_context.is_some()
                     || args.adr_options.is_some()
                     || args.adr_decision.is_some()
-                    || args.adr_consequences.is_some())
+                    || args.adr_consequences.is_some()
+                    || args.auto_adr)
             {
                 return Err(anyhow::anyhow!(
                     "ADR flags cannot be used together with --no-adr"
@@ -436,7 +524,7 @@ fn handle_session(
             let dev_log_path =
                 aiw_session::write_dev_log(&config, project, &state, input, git_info)?;
 
-            let adr_path = maybe_create_session_adr(&config, project, &args)?;
+            let adr_path = maybe_create_session_adr(&config, project, &state, &args)?;
             emit_session_end_output(
                 args.output,
                 SessionEndOutput {
@@ -1023,12 +1111,30 @@ fn build_session_end_input(
     state: &aiw_session::SessionState,
     args: &SessionEndArgs,
 ) -> Result<aiw_session::DevLogInput> {
+    if args.auto_tool.is_some() && !(args.auto || args.auto_adr) {
+        return Err(anyhow::anyhow!(
+            "--auto-tool requires --auto or --auto-adr"
+        ));
+    }
+
     let default_goal = state.topic.clone().unwrap_or_default();
-    let draft = if args.auto {
-        Some(generate_dev_log_input_from_transcript(config, state)?)
-    } else {
-        None
-    };
+    let mut draft = None;
+    if args.auto {
+        let tool_kind = resolve_auto_tool_kind(args, state)?;
+        if matches!(tool_kind, aiw_ai_tools::ToolKind::Codex) {
+            eprintln!("[aiw] auto-generation is not supported for codex; falling back to manual prompts");
+        } else {
+            match generate_dev_log_input_from_transcript(config, state, tool_kind) {
+                Ok(generated) => draft = Some(generated),
+                Err(err) => {
+                    if args.non_interactive {
+                        return Err(err.context("Auto-generation failed in non-interactive mode"));
+                    }
+                    eprintln!("[aiw] auto-generation failed, falling back to manual prompts: {err}");
+                }
+            }
+        }
+    }
 
     if args.non_interactive {
         let mut input = draft.unwrap_or(aiw_session::DevLogInput {
@@ -1068,6 +1174,7 @@ fn build_session_end_input(
 fn maybe_create_session_adr(
     config: &aiw_config::Config,
     project: &aiw_config::ProjectConfig,
+    state: &aiw_session::SessionState,
     args: &SessionEndArgs,
 ) -> Result<Option<PathBuf>> {
     if args.no_adr {
@@ -1077,6 +1184,48 @@ fn maybe_create_session_adr(
     if let Some(input) = adr_input_from_flags(args)? {
         let path = aiw_adr::create_adr(config, project, input)?;
         return Ok(Some(path));
+    }
+
+    if args.auto_adr {
+        let tool_kind = resolve_auto_tool_kind(args, state)?;
+        if matches!(tool_kind, aiw_ai_tools::ToolKind::Codex) {
+            if args.non_interactive {
+                return Err(anyhow::anyhow!(
+                    "Auto-ADR generation is not supported for codex. Use --auto-tool to select another tool."
+                ));
+            }
+            eprintln!(
+                "[aiw] auto-generation is not supported for codex; falling back to manual prompts"
+            );
+            let adr_input = prompt_adr_input(None)?;
+            let path = aiw_adr::create_adr(config, project, adr_input)?;
+            return Ok(Some(path));
+        }
+        match generate_adr_input_from_transcript(config, state, tool_kind) {
+            Ok(generated) => {
+                let adr_input = if args.non_interactive {
+                    generated
+                } else {
+                    println!(
+                        "Generated ADR draft from transcript. Press Enter to keep a suggested value."
+                    );
+                    prompt_adr_input_with_defaults(&generated)?
+                };
+                let path = aiw_adr::create_adr(config, project, adr_input)?;
+                return Ok(Some(path));
+            }
+            Err(err) => {
+                if args.non_interactive {
+                    return Err(err.context("Auto-ADR generation failed in non-interactive mode"));
+                }
+                eprintln!(
+                    "[aiw] auto-generation failed, falling back to manual prompts: {err}"
+                );
+                let adr_input = prompt_adr_input(None)?;
+                let path = aiw_adr::create_adr(config, project, adr_input)?;
+                return Ok(Some(path));
+            }
+        }
     }
 
     if args.non_interactive {
@@ -1191,12 +1340,21 @@ struct AutoDevLogFields {
     follow_up_tasks: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct AutoAdrFields {
+    title: String,
+    context: String,
+    options: String,
+    decision: String,
+    consequences: String,
+}
+
 fn generate_dev_log_input_from_transcript(
     config: &aiw_config::Config,
     state: &aiw_session::SessionState,
+    tool_kind: aiw_ai_tools::ToolKind,
 ) -> Result<aiw_session::DevLogInput> {
     let transcript = read_transcript_tail(&state.transcript_path, 12_000)?;
-    let tool_kind = aiw_ai_tools::ToolKind::parse(&state.tool)?;
     let adapter = aiw_ai_tools::ToolAdapter::from_config(config, tool_kind)?;
     let prompt = build_session_end_auto_prompt(state, &transcript);
     let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
@@ -1215,6 +1373,33 @@ fn generate_dev_log_input_from_transcript(
         decision: fields.decision.trim().to_string(),
         rationale: fields.rationale.trim().to_string(),
         follow_up_tasks: format_follow_up_tasks(&fields.follow_up_tasks),
+    })
+}
+
+fn generate_adr_input_from_transcript(
+    config: &aiw_config::Config,
+    state: &aiw_session::SessionState,
+    tool_kind: aiw_ai_tools::ToolKind,
+) -> Result<aiw_adr::AdrInput> {
+    let transcript = read_transcript_tail(&state.transcript_path, 12_000)?;
+    let adapter = aiw_ai_tools::ToolAdapter::from_config(config, tool_kind)?;
+    let prompt = build_session_end_auto_adr_prompt(state, &transcript);
+    let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
+
+    let json = extract_json_block(&output.stdout).unwrap_or(output.stdout.as_str());
+    let fields: AutoAdrFields = serde_json::from_str(json).with_context(|| {
+        format!(
+            "Failed to parse auto-generated JSON from tool output. Raw output:\n{}",
+            output.stdout
+        )
+    })?;
+
+    Ok(aiw_adr::AdrInput {
+        title: fields.title.trim().to_string(),
+        context: fields.context.trim().to_string(),
+        options: fields.options.trim().to_string(),
+        decision: fields.decision.trim().to_string(),
+        consequences: fields.consequences.trim().to_string(),
     })
 }
 
@@ -1243,6 +1428,36 @@ Rules:\n\
 - rationale: why those decisions were chosen.\n\
 - follow_up_tasks: 1-6 actionable tasks.\n\
 - If unavailable, use empty string/empty array.\n\
+\n\
+Session:\n\
+project={}\n\
+tool={}\n\
+topic={}\n\
+\n\
+Transcript tail:\n\
+{}\n",
+        state.project_display_name,
+        state.tool,
+        state.topic.clone().unwrap_or_else(|| "N/A".to_string()),
+        transcript_tail
+    )
+}
+
+fn build_session_end_auto_adr_prompt(
+    state: &aiw_session::SessionState,
+    transcript_tail: &str,
+) -> String {
+    format!(
+        "You generate an ADR draft from a terminal transcript.\n\
+Return STRICT JSON only (no markdown, no code fences) with exactly these keys:\n\
+title (string), context (string), options (string), decision (string), consequences (string).\n\
+Rules:\n\
+- title: short, concrete decision title.\n\
+- context: 2-6 sentences summarizing the situation.\n\
+- options: bullet list as a single string (use '-' lines).\n\
+- decision: 1-3 sentences describing the chosen option.\n\
+- consequences: 1-4 sentences describing tradeoffs or follow-ups.\n\
+- If unavailable, use empty string.\n\
 \n\
 Session:\n\
 project={}\n\
@@ -1296,10 +1511,36 @@ fn prompt_adr_input(title: Option<String>) -> Result<aiw_adr::AdrInput> {
     })
 }
 
+fn prompt_adr_input_with_defaults(defaults: &aiw_adr::AdrInput) -> Result<aiw_adr::AdrInput> {
+    let title = prompt_line_with_default("ADR Title", &defaults.title)?;
+    let context = prompt_line_with_default("Context", &defaults.context)?;
+    let options = prompt_line_with_default("Options considered", &defaults.options)?;
+    let decision = prompt_line_with_default("Decision", &defaults.decision)?;
+    let consequences = prompt_line_with_default("Consequences", &defaults.consequences)?;
+
+    Ok(aiw_adr::AdrInput {
+        title,
+        context,
+        options,
+        decision,
+        consequences,
+    })
+}
+
 fn prompt_yes_no(label: &str) -> Result<bool> {
     let response = prompt_line(label)?;
     let response = response.trim().to_ascii_lowercase();
     Ok(matches!(response.as_str(), "y" | "yes"))
+}
+
+fn resolve_auto_tool_kind(
+    args: &SessionEndArgs,
+    state: &aiw_session::SessionState,
+) -> Result<aiw_ai_tools::ToolKind> {
+    match &args.auto_tool {
+        Some(tool) => aiw_ai_tools::ToolKind::parse(tool),
+        None => aiw_ai_tools::ToolKind::parse(&state.tool),
+    }
 }
 
 fn build_note_prompt(command: &str, content: &str) -> String {
@@ -1420,4 +1661,32 @@ fn write_sample_config(path: &Path) -> Result<()> {
     let sample = include_str!("../../../config/ai-dev-workflow.example.toml");
     fs::write(path, sample).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn error_hints_suggests_config_init() {
+        let err = anyhow::anyhow!("Failed to read config at /tmp/missing.toml");
+        let hints = error_hints(&err);
+        assert!(hints.iter().any(|hint| hint.contains("config init")));
+    }
+
+    #[test]
+    fn error_hints_suggests_projects_list() {
+        let err = anyhow::anyhow!("project not found: demo");
+        let hints = error_hints(&err);
+        assert!(hints.iter().any(|hint| hint.contains("projects list")));
+    }
+
+    #[test]
+    fn error_hints_suggests_tool_help_from_chain() {
+        let err = anyhow::anyhow!("outer")
+            .context(anyhow::anyhow!("unsupported tool: demo"));
+        let hints = error_hints(&err);
+        assert!(hints.iter().any(|hint| hint.contains("Supported tools")));
+    }
 }

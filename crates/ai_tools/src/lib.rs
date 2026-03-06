@@ -47,7 +47,10 @@ impl ToolAdapter {
         if executable.trim().is_empty() {
             return Err(anyhow!("tool executable is empty: {}", tool.as_str()));
         }
-        Ok(Self { kind: tool, executable })
+        Ok(Self {
+            kind: tool,
+            executable,
+        })
     }
 }
 
