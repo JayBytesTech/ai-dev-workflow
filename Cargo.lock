@@ -14,6 +14,8 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

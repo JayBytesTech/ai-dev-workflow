@@ -1,11 +1,13 @@
 vault_path = "/home/jaybytestech/Documents/Vault Redux/Compendium Redux"
 templates_dir = "Templates"
+dev_log_template = "AIW_Dev_Log.md"
+adr_template = "AIW_ADR.md"
 default_transcript_root = "AI Sessions/raw"
 default_dev_log_root = "Dev Logs"
 default_adr_root = "ADR"
 
 [tools.claude]
-executable = "claude-code"
+executable = "claude"
 
 [tools.gemini]
 executable = "gemini"

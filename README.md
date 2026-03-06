@@ -72,10 +72,10 @@ aiw session start --project ai-hub --tool claude --wrap --pty --pty-cols 140 --p
 
 ## Templates
 
-Default templates live in `templates/` and are copied from the bootstrap package:
+Default templates live in `templates/` and are copied from the bootstrap package. The filenames are configurable via `dev_log_template` and `adr_template` in the TOML config:
 
-- `templates/Dev_Log_Template.md`
-- `templates/ADR_Template.md`
+- `templates/AIW_Dev_Log.md`
+- `templates/AIW_ADR.md`
 
 ## Notes
 

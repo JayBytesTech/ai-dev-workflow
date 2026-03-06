@@ -15,8 +15,8 @@ impl TemplateStore {
         }
     }
 
-    pub fn load(&self, name: &str) -> Result<String> {
-        let path = self.root.join(name);
+    pub fn load(&self, name: impl AsRef<Path>) -> Result<String> {
+        let path = self.root.join(name.as_ref());
         fs::read_to_string(&path)
             .with_context(|| format!("Failed to read template {}", path.display()))
     }

@@ -12,6 +12,8 @@ use serde::Deserialize;
 pub struct Config {
     pub vault_path: PathBuf,
     pub templates_dir: PathBuf,
+    pub dev_log_template: PathBuf,
+    pub adr_template: PathBuf,
     pub default_transcript_root: PathBuf,
     pub default_dev_log_root: PathBuf,
     pub default_adr_root: PathBuf,
@@ -106,6 +108,8 @@ impl Config {
         }
 
         self.validate_vault_relative("templates_dir", &self.templates_dir, &mut report);
+        self.validate_template_name("dev_log_template", &self.dev_log_template, &mut report);
+        self.validate_template_name("adr_template", &self.adr_template, &mut report);
         self.validate_vault_relative(
             "default_transcript_root",
             &self.default_transcript_root,
@@ -247,6 +251,31 @@ impl Config {
             report.warnings.push(format!(
                 "{field} does not exist yet: {}",
                 resolved.display()
+            ));
+        }
+    }
+
+    fn validate_template_name(&self, field: &str, path: &Path, report: &mut ValidationReport) {
+        if path.as_os_str().is_empty() {
+            report.errors.push(format!("{field} cannot be empty"));
+            return;
+        }
+        if path.is_absolute() {
+            report.errors.push(format!("{field} must be a relative path"));
+            return;
+        }
+        if has_parent_dir(path) {
+            report.errors
+                .push(format!("{field} cannot contain '..' segments"));
+            return;
+        }
+
+        let templates_root = self.vault_path.join(&self.templates_dir);
+        let template_path = templates_root.join(path);
+        if templates_root.exists() && !template_path.exists() {
+            report.warnings.push(format!(
+                "{field} does not exist yet: {}",
+                template_path.display()
             ));
         }
     }

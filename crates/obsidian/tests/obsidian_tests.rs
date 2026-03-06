@@ -27,6 +27,8 @@ fn build_config(vault: &PathBuf) -> Config {
     Config {
         vault_path: vault.clone(),
         templates_dir: PathBuf::from("Templates"),
+        dev_log_template: PathBuf::from("AIW_Dev_Log.md"),
+        adr_template: PathBuf::from("AIW_ADR.md"),
         default_transcript_root: PathBuf::from("AI Sessions/raw"),
         default_dev_log_root: PathBuf::from("Dev Logs"),
         default_adr_root: PathBuf::from("ADR"),

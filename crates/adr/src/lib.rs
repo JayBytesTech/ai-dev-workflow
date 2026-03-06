@@ -20,7 +20,7 @@ pub struct AdrInput {
 pub fn create_adr(config: &Config, project: &ProjectConfig, input: AdrInput) -> Result<PathBuf> {
     let templates_root = resolve_in_vault(&config.vault_path, &config.templates_dir)?;
     let store = TemplateStore::new(templates_root);
-    let template = store.load("ADR_Template.md")?;
+    let template = store.load(&config.adr_template)?;
 
     let adr_root = resolve_in_vault(&config.vault_path, &project.adr_dir)?;
     let adr_number = next_adr_number(&adr_root)?;
