@@ -231,7 +231,7 @@ fn detect_terminal_size() -> Option<(u16, u16)> {
         if ws.ws_col == 0 || ws.ws_row == 0 {
             return None;
         }
-        return Some((ws.ws_col, ws.ws_row));
+        Some((ws.ws_col, ws.ws_row))
     }
 
     #[cfg(not(unix))]
@@ -1315,7 +1315,7 @@ fn format_tasks(stdout: &str) -> String {
             .trim_start_matches("*")
             .trim_start_matches("•")
             .trim_start_matches(char::is_numeric)
-            .trim_start_matches(|c: char| c == '.' || c == ')')
+            .trim_start_matches(['.', ')'])
             .trim();
         if cleaned.is_empty() {
             continue;

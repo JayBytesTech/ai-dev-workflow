@@ -564,10 +564,10 @@ impl TerminalRawModeGuard {
                 return Err(anyhow!("Failed to enable raw terminal mode"));
             }
 
-            return Ok(Self {
+            Ok(Self {
                 fd,
                 original: Some(original),
-            });
+            })
         }
 
         #[cfg(not(unix))]
