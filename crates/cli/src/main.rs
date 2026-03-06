@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde::Deserialize;
 
 const DEFAULT_CONFIG_FILE: &str = "ai-dev-workflow.toml";
 
@@ -51,7 +52,7 @@ struct ConfigValidateArgs {}
 #[derive(Subcommand)]
 enum SessionCommands {
     Start(SessionStartArgs),
-    End,
+    End(SessionEndArgs),
     Status,
 }
 
@@ -79,6 +80,12 @@ struct SessionStartArgs {
     pty_cols: u16,
     #[arg(long, value_name = "rows", default_value_t = default_pty_rows(), help = "PTY rows when using --pty")]
     pty_rows: u16,
+}
+
+#[derive(Args)]
+struct SessionEndArgs {
+    #[arg(long, help = "Generate dev-log fields from transcript and edit defaults")]
+    auto: bool,
 }
 
 #[derive(Subcommand)]
@@ -270,7 +277,7 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
             }
             Ok(())
         }
-        SessionCommands::End => {
+        SessionCommands::End(args) => {
             let config = aiw_config::Config::load(&config_path)?;
             let report = config.validate();
             if !report.is_ok() {
@@ -289,7 +296,24 @@ fn handle_session(cmd: SessionCommands, config_path: Option<&Path>) -> Result<()
                 .get(&state.project_key)
                 .ok_or_else(|| anyhow::anyhow!("project not found: {}", state.project_key))?;
 
-            let input = prompt_dev_log_input()?;
+            let input = if args.auto {
+                match generate_dev_log_input_from_transcript(&config, &state) {
+                    Ok(draft) => {
+                        println!(
+                            "Generated draft from transcript. Press Enter to keep a suggested value."
+                        );
+                        prompt_dev_log_input_with_defaults(&draft)?
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[aiw] auto-generation failed, falling back to manual prompts: {err}"
+                        );
+                        prompt_dev_log_input()?
+                    }
+                }
+            } else {
+                prompt_dev_log_input()?
+            };
             let git_info = aiw_session::collect_git_info(project);
             let dev_log_path =
                 aiw_session::write_dev_log(&config, project, &state, input, git_info)?;
@@ -462,6 +486,25 @@ fn prompt_dev_log_input() -> Result<aiw_session::DevLogInput> {
     })
 }
 
+fn prompt_dev_log_input_with_defaults(
+    defaults: &aiw_session::DevLogInput,
+) -> Result<aiw_session::DevLogInput> {
+    println!("Enter session details for the dev log. Leave blank to keep suggested values.");
+    let goal = prompt_line_with_default("Goal", &defaults.goal)?;
+    let summary = prompt_line_with_default("Summary", &defaults.summary)?;
+    let decision = prompt_line_with_default("Decision", &defaults.decision)?;
+    let rationale = prompt_line_with_default("Rationale", &defaults.rationale)?;
+    let follow_up_tasks = prompt_line_with_default("Follow-up tasks", &defaults.follow_up_tasks)?;
+
+    Ok(aiw_session::DevLogInput {
+        goal,
+        summary,
+        decision,
+        rationale,
+        follow_up_tasks,
+    })
+}
+
 fn prompt_line(label: &str) -> Result<String> {
     use std::io::{self, Write};
 
@@ -472,6 +515,114 @@ fn prompt_line(label: &str) -> Result<String> {
         .read_line(&mut input)
         .context("Failed to read input")?;
     Ok(input.trim().to_string())
+}
+
+fn prompt_line_with_default(label: &str, default: &str) -> Result<String> {
+    use std::io::{self, Write};
+
+    print!("{label} [{default}]: ");
+    io::stdout().flush().context("Failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct AutoDevLogFields {
+    summary: String,
+    decision: String,
+    rationale: String,
+    follow_up_tasks: Vec<String>,
+}
+
+fn generate_dev_log_input_from_transcript(
+    config: &aiw_config::Config,
+    state: &aiw_session::SessionState,
+) -> Result<aiw_session::DevLogInput> {
+    let transcript = read_transcript_tail(&state.transcript_path, 12_000)?;
+    let tool_kind = aiw_ai_tools::ToolKind::parse(&state.tool)?;
+    let adapter = aiw_ai_tools::ToolAdapter::from_config(config, tool_kind)?;
+    let prompt = build_session_end_auto_prompt(state, &transcript);
+    let output = aiw_ai_tools::run_prompt(&adapter, &prompt)?;
+
+    let json = extract_json_block(&output.stdout).unwrap_or(output.stdout.as_str());
+    let fields: AutoDevLogFields = serde_json::from_str(json).with_context(|| {
+        format!(
+            "Failed to parse auto-generated JSON from tool output. Raw output:\n{}",
+            output.stdout
+        )
+    })?;
+
+    Ok(aiw_session::DevLogInput {
+        goal: state.topic.clone().unwrap_or_default(),
+        summary: fields.summary.trim().to_string(),
+        decision: fields.decision.trim().to_string(),
+        rationale: fields.rationale.trim().to_string(),
+        follow_up_tasks: format_follow_up_tasks(&fields.follow_up_tasks),
+    })
+}
+
+fn read_transcript_tail(path: &Path, max_chars: usize) -> Result<String> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read transcript {}", path.display()))?;
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
+        return Ok(content);
+    }
+    let skip = total_chars.saturating_sub(max_chars);
+    Ok(content.chars().skip(skip).collect())
+}
+
+fn build_session_end_auto_prompt(state: &aiw_session::SessionState, transcript_tail: &str) -> String {
+    format!(
+        "You generate a concise dev-log draft from a terminal transcript.\n\
+Return STRICT JSON only (no markdown, no code fences) with exactly these keys:\n\
+summary (string), decision (string), rationale (string), follow_up_tasks (array of strings).\n\
+Rules:\n\
+- summary: 1-3 sentences focused on meaningful outcomes.\n\
+- decision: concrete decisions made in this session.\n\
+- rationale: why those decisions were chosen.\n\
+- follow_up_tasks: 1-6 actionable tasks.\n\
+- If unavailable, use empty string/empty array.\n\
+\n\
+Session:\n\
+project={}\n\
+tool={}\n\
+topic={}\n\
+\n\
+Transcript tail:\n\
+{}\n",
+        state.project_display_name,
+        state.tool,
+        state.topic.clone().unwrap_or_else(|| "N/A".to_string()),
+        transcript_tail
+    )
+}
+
+fn extract_json_block(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+fn format_follow_up_tasks(tasks: &[String]) -> String {
+    let lines: Vec<String> = tasks
+        .iter()
+        .map(|task| task.trim())
+        .filter(|task| !task.is_empty())
+        .map(|task| format!("- [ ] {task}"))
+        .collect();
+    lines.join("\n")
 }
 
 fn prompt_adr_input(title: Option<String>) -> Result<aiw_adr::AdrInput> {
