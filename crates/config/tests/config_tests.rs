@@ -25,6 +25,7 @@ fn minimal_config(vault: &Path) -> Config {
         adr_dir: PathBuf::from("ADR/AI Hub"),
         transcript_dir: PathBuf::from("AI Sessions/raw/AI Hub"),
         allowed_note_folders: vec![PathBuf::from("Projects/AI Hub")],
+        search_folders: vec![],
     };
 
     let mut projects = std::collections::HashMap::new();

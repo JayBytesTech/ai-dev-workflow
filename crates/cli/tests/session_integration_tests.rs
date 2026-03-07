@@ -503,13 +503,7 @@ fn session_end_auto_adr_interactive_accepts_defaults() {
     end_cmd
         .arg("--config")
         .arg(&config)
-        .args([
-            "session",
-            "end",
-            "--auto-adr",
-            "--auto-tool",
-            "claude",
-        ])
+        .args(["session", "end", "--auto-adr", "--auto-tool", "claude"])
         .write_stdin("\n\n\n\n\n\n\n\n\n\n");
     let output = end_cmd.output().expect("run session end");
     assert!(output.status.success(), "session end should succeed");
@@ -519,10 +513,7 @@ fn session_end_auto_adr_interactive_accepts_defaults() {
         .filter_map(|entry| entry.ok())
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.path());
-    let adr_path = entries
-        .last()
-        .expect("adr file")
-        .path();
+    let adr_path = entries.last().expect("adr file").path();
     let adr_body = fs::read_to_string(&adr_path).expect("read adr");
     assert!(
         adr_body.contains("Auto ADR"),

@@ -44,6 +44,8 @@ pub struct ProjectConfig {
     pub adr_dir: PathBuf,
     pub transcript_dir: PathBuf,
     pub allowed_note_folders: Vec<PathBuf>,
+    #[serde(default)]
+    pub search_folders: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +101,7 @@ struct ProjectOverride {
     adr_dir: Option<PathBuf>,
     transcript_dir: Option<PathBuf>,
     allowed_note_folders: Option<Vec<PathBuf>>,
+    search_folders: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Default)]
@@ -442,6 +445,9 @@ fn apply_profile(config: &mut Config, profile: &ProfileConfig) -> Result<()> {
             }
             if let Some(v) = &override_cfg.allowed_note_folders {
                 project.allowed_note_folders = v.clone();
+            }
+            if let Some(v) = &override_cfg.search_folders {
+                project.search_folders = v.clone();
             }
         }
     }

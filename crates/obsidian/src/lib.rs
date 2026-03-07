@@ -5,6 +5,9 @@ use anyhow::{anyhow, Context, Result};
 
 use aiw_config::{resolve_in_vault, Config, ProjectConfig};
 
+pub mod search;
+pub use search::{search_vault, ContentTypeFilter, LineMatch, SearchOptions, SearchResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteCommand {
     Summarize,

@@ -35,6 +35,7 @@ enum Commands {
     Adr(AdrCommands),
     #[command(subcommand)]
     Projects(ProjectsCommands),
+    Search(SearchArgs),
 }
 
 #[derive(Subcommand)]
@@ -112,10 +113,7 @@ struct SessionEndArgs {
         help = "Generate dev-log fields from transcript and edit defaults"
     )]
     auto: bool,
-    #[arg(
-        long,
-        help = "Auto-generate ADR fields from transcript"
-    )]
+    #[arg(long, help = "Auto-generate ADR fields from transcript")]
     auto_adr: bool,
     #[arg(
         long = "auto-tool",
@@ -226,6 +224,53 @@ enum ProjectsCommands {
     List,
 }
 
+#[derive(Args)]
+struct SearchArgs {
+    /// Keyword or phrase to search for
+    query: String,
+
+    /// Restrict to a specific project (default: all projects)
+    #[arg(long)]
+    project: Option<String>,
+
+    /// Content type to search
+    #[arg(long = "type", value_enum, default_value = "all")]
+    content_type: ContentTypeArg,
+
+    /// Only return results from files dated within N days
+    #[arg(long)]
+    since: Option<u32>,
+
+    /// Lines of context around each match
+    #[arg(long, default_value = "2")]
+    context: usize,
+
+    /// Include raw transcripts in search
+    #[arg(long)]
+    include_transcripts: bool,
+
+    /// Additional vault-relative folder to include (repeatable)
+    #[arg(long = "folder")]
+    folders: Vec<String>,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ContentTypeArg {
+    All,
+    DevLogs,
+    Adrs,
+}
+
+impl From<ContentTypeArg> for aiw_obsidian::ContentTypeFilter {
+    fn from(arg: ContentTypeArg) -> Self {
+        match arg {
+            ContentTypeArg::All => aiw_obsidian::ContentTypeFilter::All,
+            ContentTypeArg::DevLogs => aiw_obsidian::ContentTypeFilter::DevLogs,
+            ContentTypeArg::Adrs => aiw_obsidian::ContentTypeFilter::Adrs,
+        }
+    }
+}
+
 fn default_pty_cols() -> u16 {
     detect_terminal_size().map(|(cols, _)| cols).unwrap_or(120)
 }
@@ -279,6 +324,7 @@ fn run() -> Result<()> {
         Commands::Session(cmd) => handle_session(cmd, cli.config.as_deref(), profile),
         Commands::Note(cmd) => handle_note(cmd, cli.config.as_deref(), profile),
         Commands::Adr(cmd) => handle_adr(cmd, cli.config.as_deref(), profile),
+        Commands::Search(args) => handle_search(args, cli.config.as_deref(), profile),
     }
 }
 
@@ -667,6 +713,59 @@ fn handle_adr(cmd: AdrCommands, config_path: Option<&Path>, profile: Option<&str
             Ok(())
         }
     }
+}
+
+fn handle_search(
+    args: SearchArgs,
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<()> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = aiw_config::Config::load_with_profile(&config_path, profile)?;
+    let report = config.validate();
+    if !report.is_ok() {
+        println!("{report}");
+        return Err(anyhow::anyhow!("config validation failed"));
+    }
+
+    let project_keys = match &args.project {
+        Some(k) => vec![k.clone()],
+        None => config.projects.keys().cloned().collect(),
+    };
+
+    let options = aiw_obsidian::SearchOptions {
+        query: args.query,
+        project_keys,
+        content_type: args.content_type.into(),
+        since_days: args.since,
+        context_lines: args.context,
+        include_transcripts: args.include_transcripts,
+        extra_folders: args.folders,
+    };
+
+    let results = aiw_obsidian::search_vault(&config, &options)?;
+
+    if results.is_empty() {
+        println!("No matches found.");
+        return Ok(());
+    }
+
+    for result in &results {
+        println!("\n── {} ──", result.vault_relative);
+        for m in &result.matches {
+            for (i, line) in m.context_before.iter().enumerate() {
+                let n = m.line_number - m.context_before.len() + i;
+                println!("  {:>4}  {}", n, line);
+            }
+            println!("  {:>4}: {}", m.line_number, m.line);
+            for (i, line) in m.context_after.iter().enumerate() {
+                println!("  {:>4}  {}", m.line_number + 1 + i, line);
+            }
+        }
+    }
+
+    println!("\n{} file(s) matched.", results.len());
+    Ok(())
 }
 
 fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
@@ -1112,9 +1211,7 @@ fn build_session_end_input(
     args: &SessionEndArgs,
 ) -> Result<aiw_session::DevLogInput> {
     if args.auto_tool.is_some() && !(args.auto || args.auto_adr) {
-        return Err(anyhow::anyhow!(
-            "--auto-tool requires --auto or --auto-adr"
-        ));
+        return Err(anyhow::anyhow!("--auto-tool requires --auto or --auto-adr"));
     }
 
     let default_goal = state.topic.clone().unwrap_or_default();
@@ -1122,7 +1219,9 @@ fn build_session_end_input(
     if args.auto {
         let tool_kind = resolve_auto_tool_kind(args, state)?;
         if matches!(tool_kind, aiw_ai_tools::ToolKind::Codex) {
-            eprintln!("[aiw] auto-generation is not supported for codex; falling back to manual prompts");
+            eprintln!(
+                "[aiw] auto-generation is not supported for codex; falling back to manual prompts"
+            );
         } else {
             match generate_dev_log_input_from_transcript(config, state, tool_kind) {
                 Ok(generated) => draft = Some(generated),
@@ -1130,7 +1229,9 @@ fn build_session_end_input(
                     if args.non_interactive {
                         return Err(err.context("Auto-generation failed in non-interactive mode"));
                     }
-                    eprintln!("[aiw] auto-generation failed, falling back to manual prompts: {err}");
+                    eprintln!(
+                        "[aiw] auto-generation failed, falling back to manual prompts: {err}"
+                    );
                 }
             }
         }
@@ -1218,9 +1319,7 @@ fn maybe_create_session_adr(
                 if args.non_interactive {
                     return Err(err.context("Auto-ADR generation failed in non-interactive mode"));
                 }
-                eprintln!(
-                    "[aiw] auto-generation failed, falling back to manual prompts: {err}"
-                );
+                eprintln!("[aiw] auto-generation failed, falling back to manual prompts: {err}");
                 let adr_input = prompt_adr_input(None)?;
                 let path = aiw_adr::create_adr(config, project, adr_input)?;
                 return Ok(Some(path));
@@ -1684,8 +1783,7 @@ mod tests {
 
     #[test]
     fn error_hints_suggests_tool_help_from_chain() {
-        let err = anyhow::anyhow!("outer")
-            .context(anyhow::anyhow!("unsupported tool: demo"));
+        let err = anyhow::anyhow!("outer").context(anyhow::anyhow!("unsupported tool: demo"));
         let hints = error_hints(&err);
         assert!(hints.iter().any(|hint| hint.contains("Supported tools")));
     }

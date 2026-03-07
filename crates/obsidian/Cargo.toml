@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 aiw-config = { path = "../config" }
 
 [dev-dependencies]
