@@ -39,6 +39,7 @@ dependencies = [
  "aiw-templates",
  "anyhow",
  "chrono",
+ "tempfile",
 ]
 
 [[package]]
@@ -91,6 +92,7 @@ name = "aiw-templates"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
 ]
 
 [[package]]

@@ -9,3 +9,6 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 aiw-config = { path = "../config" }
 aiw-templates = { path = "../templates" }
+
+[dev-dependencies]
+tempfile = "3"

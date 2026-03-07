@@ -107,3 +107,92 @@ fn slugify(title: &str) -> String {
         trimmed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- slugify ---
+
+    #[test]
+    fn slugify_lowercases_and_replaces_spaces() {
+        assert_eq!(slugify("Use Rust for CLI"), "use-rust-for-cli");
+    }
+
+    #[test]
+    fn slugify_collapses_consecutive_separators() {
+        assert_eq!(slugify("foo  --  bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_trims_leading_trailing_separators() {
+        assert_eq!(slugify("  hello world  "), "hello-world");
+    }
+
+    #[test]
+    fn slugify_empty_string_returns_adr() {
+        assert_eq!(slugify(""), "adr");
+    }
+
+    #[test]
+    fn slugify_only_specials_returns_adr() {
+        assert_eq!(slugify("!!! ???"), "adr");
+    }
+
+    #[test]
+    fn slugify_preserves_digits() {
+        assert_eq!(slugify("Option 2"), "option-2");
+    }
+
+    // --- parse_adr_number ---
+
+    #[test]
+    fn parse_adr_number_valid() {
+        assert_eq!(parse_adr_number("ADR-0001-some-title.md"), Some(1));
+        assert_eq!(parse_adr_number("ADR-0042-foo.md"), Some(42));
+        assert_eq!(parse_adr_number("ADR-9999-bar"), Some(9999));
+    }
+
+    #[test]
+    fn parse_adr_number_wrong_prefix() {
+        assert_eq!(parse_adr_number("adr-0001-foo.md"), None);
+        assert_eq!(parse_adr_number("0001-foo.md"), None);
+        assert_eq!(parse_adr_number(""), None);
+    }
+
+    #[test]
+    fn parse_adr_number_non_digit_after_prefix() {
+        assert_eq!(parse_adr_number("ADR-abc-foo.md"), None);
+        assert_eq!(parse_adr_number("ADR-001-foo.md"), None); // only 3 digits
+    }
+
+    // --- next_adr_number ---
+
+    #[test]
+    fn next_adr_number_returns_1_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(next_adr_number(dir.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn next_adr_number_returns_1_for_nonexistent_dir() {
+        let path = std::path::Path::new("/tmp/aiw-test-no-such-dir-xyz");
+        assert_eq!(next_adr_number(path).unwrap(), 1);
+    }
+
+    #[test]
+    fn next_adr_number_increments_past_highest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ADR-0003-foo.md"), "").unwrap();
+        std::fs::write(dir.path().join("ADR-0001-bar.md"), "").unwrap();
+        assert_eq!(next_adr_number(dir.path()).unwrap(), 4);
+    }
+
+    #[test]
+    fn next_adr_number_ignores_non_adr_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+        assert_eq!(next_adr_number(dir.path()).unwrap(), 1);
+    }
+}

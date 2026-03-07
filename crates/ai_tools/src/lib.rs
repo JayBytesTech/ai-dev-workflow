@@ -61,6 +61,108 @@ pub struct ToolOutput {
     pub status: i32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiw_config::{Config, ProjectConfig, ToolConfig, ToolsConfig};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn make_config(claude_exe: &str, gemini_exe: &str, codex_exe: &str) -> Config {
+        Config {
+            vault_path: PathBuf::from("/tmp/vault"),
+            templates_dir: PathBuf::from("templates"),
+            dev_log_template: PathBuf::from("dev_log.md"),
+            adr_template: PathBuf::from("adr.md"),
+            default_transcript_root: PathBuf::from("transcripts"),
+            default_dev_log_root: PathBuf::from("dev_logs"),
+            default_adr_root: PathBuf::from("adrs"),
+            tools: ToolsConfig {
+                claude: ToolConfig {
+                    executable: claude_exe.to_string(),
+                },
+                gemini: ToolConfig {
+                    executable: gemini_exe.to_string(),
+                },
+                codex: ToolConfig {
+                    executable: codex_exe.to_string(),
+                },
+            },
+            projects: HashMap::new(),
+        }
+    }
+
+    // --- ToolKind::parse ---
+
+    #[test]
+    fn parse_known_tools() {
+        assert!(matches!(
+            ToolKind::parse("claude").unwrap(),
+            ToolKind::Claude
+        ));
+        assert!(matches!(
+            ToolKind::parse("gemini").unwrap(),
+            ToolKind::Gemini
+        ));
+        assert!(matches!(ToolKind::parse("codex").unwrap(), ToolKind::Codex));
+    }
+
+    #[test]
+    fn parse_is_case_insensitive() {
+        assert!(matches!(
+            ToolKind::parse("Claude").unwrap(),
+            ToolKind::Claude
+        ));
+        assert!(matches!(
+            ToolKind::parse("GEMINI").unwrap(),
+            ToolKind::Gemini
+        ));
+        assert!(matches!(ToolKind::parse("CODEX").unwrap(), ToolKind::Codex));
+    }
+
+    #[test]
+    fn parse_unknown_tool_returns_error() {
+        let err = ToolKind::parse("gpt4").unwrap_err().to_string();
+        assert!(err.contains("unsupported tool: gpt4"));
+    }
+
+    // --- ToolKind::as_str ---
+
+    #[test]
+    fn as_str_round_trips() {
+        assert_eq!(ToolKind::Claude.as_str(), "claude");
+        assert_eq!(ToolKind::Gemini.as_str(), "gemini");
+        assert_eq!(ToolKind::Codex.as_str(), "codex");
+    }
+
+    // --- ToolAdapter::from_config ---
+
+    #[test]
+    fn from_config_returns_adapter_with_correct_executable() {
+        let config = make_config("claude-bin", "gemini-bin", "codex-bin");
+        let adapter = ToolAdapter::from_config(&config, ToolKind::Gemini).unwrap();
+        assert_eq!(adapter.executable, "gemini-bin");
+    }
+
+    #[test]
+    fn from_config_empty_executable_returns_error() {
+        let config = make_config("", "gemini-bin", "codex-bin");
+        let err = ToolAdapter::from_config(&config, ToolKind::Claude)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool executable is empty: claude"));
+    }
+
+    #[test]
+    fn from_config_whitespace_only_executable_returns_error() {
+        let config = make_config("claude-bin", "  ", "codex-bin");
+        let err = ToolAdapter::from_config(&config, ToolKind::Gemini)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tool executable is empty: gemini"));
+    }
+}
+
 pub fn run_prompt(adapter: &ToolAdapter, prompt: &str) -> Result<ToolOutput> {
     let mut child = Command::new(&adapter.executable)
         .stdin(Stdio::piped())
