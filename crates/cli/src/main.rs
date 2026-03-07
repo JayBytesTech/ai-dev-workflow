@@ -46,6 +46,8 @@ enum Commands {
     Projects(ProjectsCommands),
     #[command(about = "Search the vault for a keyword or phrase")]
     Search(SearchArgs),
+    #[command(about = "Print shell completion script for the given shell")]
+    Completions(CompletionsArgs),
 }
 
 #[derive(Subcommand)]
@@ -317,6 +319,12 @@ struct SearchArgs {
     folders: Vec<String>,
 }
 
+#[derive(Args)]
+struct CompletionsArgs {
+    #[arg(value_enum, help = "Target shell")]
+    shell: clap_complete::Shell,
+}
+
 #[derive(Clone, ValueEnum)]
 enum ContentTypeArg {
     All,
@@ -375,10 +383,27 @@ fn detect_terminal_size() -> Option<(u16, u16)> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct WrappedToolExit(i32);
+
+impl std::fmt::Display for WrappedToolExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wrapped tool exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for WrappedToolExit {}
+
 fn main() {
-    if let Err(err) = run() {
-        emit_error_with_hints(&err);
-        std::process::exit(1);
+    match run() {
+        Ok(()) => {}
+        Err(err) => {
+            if let Some(WrappedToolExit(code)) = err.downcast_ref::<WrappedToolExit>() {
+                std::process::exit(*code);
+            }
+            emit_error_with_hints(&err);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -394,6 +419,13 @@ fn run() -> Result<()> {
         Commands::Note(cmd) => cmd::note::handle_note(cmd, cli.config.as_deref(), profile),
         Commands::Adr(cmd) => cmd::adr::handle_adr(cmd, cli.config.as_deref(), profile),
         Commands::Search(args) => cmd::search::handle_search(args, cli.config.as_deref(), profile),
+        Commands::Completions(args) => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            let mut cmd = Cli::command();
+            generate(args.shell, &mut cmd, "aiw", &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 

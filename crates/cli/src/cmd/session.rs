@@ -160,6 +160,9 @@ pub(crate) fn handle_session(
                 };
                 let _ = aiw_session::update_capture_status(&store, status)?;
                 println!("Tool exited with code {code}");
+                if code != 0 {
+                    return Err(anyhow::Error::new(crate::WrappedToolExit(code)));
+                }
             }
             Ok(())
         }

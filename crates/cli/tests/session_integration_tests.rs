@@ -522,6 +522,46 @@ fn session_end_auto_adr_interactive_accepts_defaults() {
 }
 
 #[test]
+fn search_finds_content_in_dev_logs() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = write_test_config(temp.path());
+
+    let dev_logs_dir = temp.path().join("vault/Dev Logs/AI Hub");
+    fs::create_dir_all(&dev_logs_dir).expect("create dev logs dir");
+    fs::write(
+        dev_logs_dir.join("test-note.md"),
+        "# Dev Log\nunique-search-needle is here\n",
+    )
+    .expect("write test note");
+
+    run_aiw(&config, &["search", "unique-search-needle"])
+        .success()
+        .stdout(contains("unique-search-needle"))
+        .stdout(contains("1 file(s) matched"));
+}
+
+#[test]
+fn config_init_creates_valid_toml() {
+    let temp = TempDir::new().expect("tempdir");
+    let output_path = temp.path().join("test-config.toml");
+
+    // First run: should succeed and create the file.
+    Command::new(env!("CARGO_BIN_EXE_aiw"))
+        .args(["config", "init", "--output"])
+        .arg(&output_path)
+        .assert()
+        .success();
+    assert!(output_path.exists(), "config file should be created");
+
+    // Second run: should fail because the file already exists.
+    Command::new(env!("CARGO_BIN_EXE_aiw"))
+        .args(["config", "init", "--output"])
+        .arg(&output_path)
+        .assert()
+        .failure();
+}
+
+#[test]
 fn config_show_resolved_applies_profile() {
     let temp = TempDir::new().expect("tempdir");
     let config = write_profile_config(temp.path());

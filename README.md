@@ -3,7 +3,7 @@
 `ai-dev-workflow` is a Rust CLI that captures AI-assisted development sessions and stores transcripts, dev logs, and ADRs inside an Obsidian vault.
 
 ## Status
-Stage 8 (partial): config parsing/validation, session start/end/status, dev log generation, ADR creation, note scan detection, AI tool adapters, note processing, and a transcript capture wrapper (pipe or PTY) are implemented.
+All core features are implemented: config parsing/validation with profiles, session start/end/status, transcript capture (pipe and PTY modes), dev log generation, ADR creation, note scanning and processing, AI tool adapters, vault keyword search, shell completions, and release automation.
 
 ## Build
 
@@ -59,7 +59,7 @@ List projects:
 cargo run -p aiw -- projects list
 ```
 
-## CLI (planned)
+## CLI
 
 ```text
 aiw config init
@@ -76,6 +76,9 @@ aiw note scan
 
 aiw adr create
 aiw projects list
+
+aiw search <query> [--project <name>] [--type dev-logs|adrs|all] [--since <days>]
+aiw completions <bash|zsh|fish|...>
 ```
 
 Use `--profile <name>` with any command to apply profile-specific overrides.
@@ -138,6 +141,31 @@ Auto-generate ADR fields with an explicit tool:
 
 ```bash
 aiw session end --auto-adr --auto-tool claude
+```
+
+## Search
+
+Search all vault files for a keyword or phrase:
+
+```bash
+aiw search "my keyword"
+aiw search "design decision" --project ai-hub --type dev-logs
+aiw search "ADR" --since 30
+```
+
+## Shell Completions
+
+Generate a shell completion script and source it:
+
+```bash
+# bash
+aiw completions bash >> ~/.bashrc
+
+# zsh
+aiw completions zsh >> ~/.zshrc
+
+# fish
+aiw completions fish > ~/.config/fish/completions/aiw.fish
 ```
 
 ## Templates
